@@ -89,7 +89,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     'buscar' => $_POST['buscar'] ?? ''
                 ];
 
-                // Configurar fechas
+                // Configurar fechas según el día seleccionado
+                $fecha_inicio = '';
+                $fecha_fin = '';
+                
                 switch ($filtros_ajax['dia']) {
                     case 'hoy':
                         $fecha_inicio = date('Y-m-d') . ' 00:00:00';
@@ -107,10 +110,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
                 // Paginación
                 $items_por_pagina = Config::ITEMS_PER_PAGE;
-                $pagina_ajax = (int)($_POST['pagina'] ?? 1);
+                $pagina_ajax = max(1, (int)($_POST['pagina'] ?? 1));
                 $offset_ajax = ($pagina_ajax - 1) * $items_por_pagina;
 
-                // Query principal
+                // Query principal optimizada
                 $query_ajax = "SELECT e.*, 
                                      d.nombre as deporte_nombre, 
                                      d.icono as deporte_icono,
@@ -121,18 +124,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                                      ch.logo as canal_logo,
                                      TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) as minutos_hasta_evento,
                                      CASE 
-                                        WHEN NOW() >= e.fecha_evento AND NOW() <= DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                                        WHEN NOW() BETWEEN e.fecha_evento 
+                                        AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
                                         THEN TRUE ELSE FALSE
                                      END as en_vivo_calculado,
                                      CASE 
-                                        WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) <= 15 AND TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) >= -COALESCE(e.duracion_minutos, d.duracion_tipica, 90)
+                                        WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) BETWEEN -COALESCE(e.duracion_minutos, d.duracion_tipica, 90) AND 15
                                         THEN TRUE ELSE FALSE
                                      END as enlace_activo
                               FROM eventos e
                               LEFT JOIN deportes d ON e.deporte_id = d.id
                               LEFT JOIN competiciones c ON e.competicion_id = c.id
                               LEFT JOIN canales ch ON e.canal_id = ch.id
-                              WHERE e.fecha_evento BETWEEN ? AND ?";
+                              WHERE e.fecha_evento BETWEEN ? AND ?
+                              AND (
+                                  e.fecha_evento > NOW()
+                                  OR
+                                  NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                              )";
 
                 $params_ajax = [$fecha_inicio, $fecha_fin];
 
@@ -152,60 +161,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 if (!empty($filtros_ajax['buscar'])) {
                     $query_ajax .= " AND (e.titulo LIKE ? OR e.descripcion LIKE ? OR e.equipo_local LIKE ? OR e.equipo_visitante LIKE ?)";
                     $buscar_param = '%' . $filtros_ajax['buscar'] . '%';
-                    $params_ajax[] = $buscar_param;
-                    $params_ajax[] = $buscar_param;
-                    $params_ajax[] = $buscar_param;
-                    $params_ajax[] = $buscar_param;
+                    array_push($params_ajax, $buscar_param, $buscar_param, $buscar_param, $buscar_param);
                 }
 
-                // Ordenar
-                if ($filtros_ajax['dia'] == 'hoy') {
-                    $query_ajax .= " ORDER BY 
-                                    CASE 
-                                        WHEN NOW() >= e.fecha_evento AND NOW() <= DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE) 
-                                        THEN 0 
-                                        ELSE 1 
-                                    END,
-                                    e.fecha_evento ASC";
-                } else {
-                    $query_ajax .= " ORDER BY e.fecha_evento ASC";
-                }
+                // Ordenar: eventos en vivo primero, luego por fecha
+                $query_ajax .= " ORDER BY 
+                                CASE 
+                                    WHEN NOW() BETWEEN e.fecha_evento 
+                                    AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                                    THEN 0 
+                                    ELSE 1 
+                                END,
+                                e.fecha_evento ASC";
 
-                // Contar total
-                $query_count_ajax = "SELECT COUNT(*) as total FROM eventos e
-                                    LEFT JOIN deportes d ON e.deporte_id = d.id
-                                    LEFT JOIN competiciones c ON e.competicion_id = c.id
-                                    LEFT JOIN canales ch ON e.canal_id = ch.id
-                                    WHERE e.fecha_evento BETWEEN ? AND ?";
+                // Contar total sin límites
+                $query_count_ajax = str_replace(
+                    "SELECT e.*, d.nombre as deporte_nombre, d.icono as deporte_icono, d.duracion_tipica, c.nombre as competicion_nombre, c.pais as competicion_pais, ch.nombre as canal_nombre, ch.logo as canal_logo, TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) as minutos_hasta_evento, CASE WHEN NOW() BETWEEN e.fecha_evento AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE) THEN TRUE ELSE FALSE END as en_vivo_calculado, CASE WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) BETWEEN -COALESCE(e.duracion_minutos, d.duracion_tipica, 90) AND 15 THEN TRUE ELSE FALSE END as enlace_activo",
+                    "SELECT COUNT(*) as total",
+                    $query_ajax
+                );
                 
-                $params_count = [$fecha_inicio, $fecha_fin];
-                
-                if (!empty($filtros_ajax['deporte'])) {
-                    $query_count_ajax .= " AND e.deporte_id = ?";
-                    $params_count[] = $filtros_ajax['deporte'];
-                }
-                if (!empty($filtros_ajax['competicion'])) {
-                    $query_count_ajax .= " AND e.competicion_id = ?";
-                    $params_count[] = $filtros_ajax['competicion'];
-                }
-                if (!empty($filtros_ajax['canal'])) {
-                    $query_count_ajax .= " AND e.canal_id = ?";
-                    $params_count[] = $filtros_ajax['canal'];
-                }
-                if (!empty($filtros_ajax['buscar'])) {
-                    $query_count_ajax .= " AND (e.titulo LIKE ? OR e.descripcion LIKE ? OR e.equipo_local LIKE ? OR e.equipo_visitante LIKE ?)";
-                    $buscar_param = '%' . $filtros_ajax['buscar'] . '%';
-                    $params_count[] = $buscar_param;
-                    $params_count[] = $buscar_param;
-                    $params_count[] = $buscar_param;
-                    $params_count[] = $buscar_param;
-                }
+                // Remover ORDER BY del count
+                $query_count_ajax = preg_replace('/ORDER BY.*$/s', '', $query_count_ajax);
                 
                 $stmt_count_ajax = $db->prepare($query_count_ajax);
-                $stmt_count_ajax->execute($params_count);
-                $total_eventos_ajax = $stmt_count_ajax->fetch()['total'];
+                $stmt_count_ajax->execute($params_ajax);
+                $total_eventos_ajax = $stmt_count_ajax->fetch(PDO::FETCH_ASSOC)['total'];
 
-                // Paginación
+                // Aplicar paginación
                 $query_ajax .= " LIMIT ? OFFSET ?";
                 $params_ajax[] = $items_por_pagina;
                 $params_ajax[] = $offset_ajax;
@@ -218,136 +201,130 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $html_eventos = '';
                 $eventos_en_vivo = 0;
 
-                foreach ($eventos_ajax as $evento) {
-                    $enlace_disponible = $evento['enlace_activo'] || $evento['en_vivo_calculado'];
-                    $es_live = $evento['en_vivo_calculado'];
-                    $tiempo_restante = $evento['minutos_hasta_evento'];
-                    $clase_tiempo = $es_live ? 'live' : ($tiempo_restante <= 15 && $tiempo_restante > 0 ? 'soon' : '');
-                    $clase_card = $es_live ? 'live-event' : '';
+                if (empty($eventos_ajax)) {
+                    $icono_vacio = $filtros_ajax['dia'] == 'hoy' ? '😴' : ($filtros_ajax['dia'] == 'manana' ? '🌙' : '📅');
+                    $mensaje_dia = $filtros_ajax['dia'] == 'hoy' ? 'hoy' : ($filtros_ajax['dia'] == 'manana' ? 'mañana' : 'próximos');
                     
-                    if ($es_live) $eventos_en_vivo++;
+                    $html_eventos = '<div class="no-events">
+                        <div class="no-events-icon">' . $icono_vacio . '</div>
+                        <h3>No hay eventos ' . $mensaje_dia . '</h3>
+                        <p>No se encontraron eventos con los filtros aplicados.</p>
+                        <p>Prueba ajustando los filtros o revisa en otro día.</p>
+                    </div>';
+                } else {
+                    $html_eventos = '<div class="events-list" id="events-list">';
+                    
+                    foreach ($eventos_ajax as $evento) {
+                        $enlace_disponible = $evento['enlace_activo'] || $evento['en_vivo_calculado'];
+                        $es_live = $evento['en_vivo_calculado'];
+                        $tiempo_restante = $evento['minutos_hasta_evento'];
+                        $clase_tiempo = $es_live ? 'live' : ($tiempo_restante <= 15 && $tiempo_restante > 0 ? 'soon' : '');
+                        $clase_card = $es_live ? 'live-event' : '';
+                        
+                        if ($es_live) $eventos_en_vivo++;
 
-                    $html_eventos .= '<div class="event-card-wrapper">';
-                    
-                    if ($enlace_disponible) {
-                        $html_eventos .= '<a href="evento.php?id=' . $evento['id'] . '&token=' . $evento['token_acceso'] . '" class="event-link">';
-                    } else {
-                        $html_eventos .= '<div class="event-link disabled">';
-                    }
-
-                    $html_eventos .= '<div class="event-card ' . $clase_card . '">';
-                    
-                    // Tiempo del evento
-                    $html_eventos .= '<div class="event-left">';
-                    $html_eventos .= '<div class="event-time ' . $clase_tiempo . '">';
-                    if ($es_live) {
-                        $html_eventos .= '🔴 LIVE<div class="live-indicator">●</div>';
-                    } else {
-                        $html_eventos .= date('H:i', strtotime($evento['fecha_evento']));
-                        if ($tiempo_restante <= 15 && $tiempo_restante > 0) {
-                            $html_eventos .= '<span class="countdown-badge">' . $tiempo_restante . 'min</span>';
+                        // Generar token si es necesario
+                        if (!isset($evento['token_acceso']) || empty($evento['token_acceso'])) {
+                            $evento['token_acceso'] = generateToken($evento['id']);
                         }
-                    }
-                    $html_eventos .= '</div>';
-                    
-                    // Información del evento
-                    $html_eventos .= '<div class="event-info">';
-                    $html_eventos .= '<div class="event-title">' . htmlspecialchars($evento['titulo']);
-                    if (isset($evento['destacado']) && $evento['destacado']) {
-                        $html_eventos .= '<span style="color: #f59e0b;">⭐</span>';
-                    }
-                    $html_eventos .= '</div>';
-                    
-                    $html_eventos .= '<div class="event-details">';
-                    if ($evento['deporte_nombre']) {
-                        $html_eventos .= '<span>⚽ ' . htmlspecialchars($evento['deporte_nombre']) . '</span>';
-                    }
-                    if ($evento['competicion_nombre']) {
-                        $html_eventos .= '<span>• 🏆 ' . htmlspecialchars($evento['competicion_nombre']) . '</span>';
-                    }
-                    if ($filtros_ajax['dia'] != 'hoy') {
-                        $html_eventos .= '<span>• 📅 ' . Config::formatDate($evento['fecha_evento'], 'd/m/Y') . '</span>';
-                    }
-                    $html_eventos .= '</div>';
 
-                    // Información de tiempo
-                    if ($filtros_ajax['dia'] == 'hoy') {
-                        if (!$es_live && $tiempo_restante > 0) {
-                            $html_eventos .= '<div class="tiempo-restante">';
-                            if ($tiempo_restante <= 15) {
-                                $html_eventos .= '⚡ Disponible en ' . $tiempo_restante . ' minutos';
-                            } else {
-                                $html_eventos .= '🕒 Comienza en ' . formatTiempoRestante($tiempo_restante);
+                        $html_eventos .= '<div class="event-card-wrapper">';
+                        
+                        if ($enlace_disponible) {
+                            $html_eventos .= '<a href="evento.php?id=' . $evento['id'] . '&token=' . $evento['token_acceso'] . '" class="event-link">';
+                        } else {
+                            $html_eventos .= '<div class="event-link disabled">';
+                        }
+
+                        $html_eventos .= '<div class="event-card ' . $clase_card . '">';
+                        
+                        // Sección izquierda
+                        $html_eventos .= '<div class="event-left">';
+                        $html_eventos .= '<div class="event-time ' . $clase_tiempo . '">';
+                        if ($es_live) {
+                            $html_eventos .= '🔴 LIVE<div class="live-indicator">●</div>';
+                        } else {
+                            $html_eventos .= date('H:i', strtotime($evento['fecha_evento']));
+                            if ($tiempo_restante <= 15 && $tiempo_restante > 0) {
+                                $html_eventos .= '<span class="countdown-badge">' . $tiempo_restante . 'min</span>';
                             }
-                            $html_eventos .= '</div>';
-                        } elseif ($es_live) {
-                            $html_eventos .= '<div class="tiempo-restante" style="color: #ef4444; font-weight: 600;">🔴 Transmisión en vivo</div>';
+                        }
+                        $html_eventos .= '</div>';
+                        
+                        // Información del evento
+                        $html_eventos .= '<div class="event-info">';
+                        $html_eventos .= '<div class="event-title">' . htmlspecialchars($evento['titulo']);
+                        if (isset($evento['destacado']) && $evento['destacado']) {
+                            $html_eventos .= ' <span style="color: #f59e0b;">⭐</span>';
+                        }
+                        $html_eventos .= '</div>';
+                        
+                        $html_eventos .= '<div class="event-details">';
+                        if ($evento['deporte_nombre']) {
+                            $html_eventos .= '<span>⚽ ' . htmlspecialchars($evento['deporte_nombre']) . '</span>';
+                        }
+                        if ($evento['competicion_nombre']) {
+                            $html_eventos .= '<span>• 🏆 ' . htmlspecialchars($evento['competicion_nombre']) . '</span>';
+                        }
+                        if ($filtros_ajax['dia'] != 'hoy') {
+                            $html_eventos .= '<span>• 📅 ' . Config::formatDate($evento['fecha_evento'], 'd/m/Y') . '</span>';
+                        }
+                        $html_eventos .= '</div>';
+
+                        // Información de tiempo
+                        if ($filtros_ajax['dia'] == 'hoy') {
+                            if (!$es_live && $tiempo_restante > 0) {
+                                $html_eventos .= '<div class="tiempo-restante">';
+                                if ($tiempo_restante <= 15) {
+                                    $html_eventos .= '⚡ Disponible en ' . $tiempo_restante . ' minutos';
+                                } else {
+                                    $html_eventos .= '🕒 Comienza en ' . formatTiempoRestante($tiempo_restante);
+                                }
+                                $html_eventos .= '</div>';
+                            } elseif ($es_live) {
+                                $html_eventos .= '<div class="tiempo-restante" style="color: #ef4444; font-weight: 600;">🔴 Transmisión en vivo</div>';
+                            }
+                        } else {
+                            $html_eventos .= '<div class="tiempo-restante">📅 ' . formatTiempoRestante($tiempo_restante) . '</div>';
+                        }
+
+                        $html_eventos .= '</div></div>';
+
+                        // Sección derecha
+                        $html_eventos .= '<div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">';
+                        if ($evento['canal_nombre']) {
+                            $html_eventos .= '<div class="event-channel">📺 ' . htmlspecialchars($evento['canal_nombre']) . '</div>';
                         }
                         
-                        $html_eventos .= '<div class="access-info">';
-                        if ($enlace_disponible) {
-                            $html_eventos .= '<span class="access-badge access-available">✅ Acceso disponible</span>';
-                        } elseif ($tiempo_restante <= 30) {
-                            $html_eventos .= '<span class="access-badge access-soon">⏱️ Próximamente</span>';
+                        $html_eventos .= '<span class="event-status status-' . $evento['estado'] . '">';
+                        if ($es_live) {
+                            $html_eventos .= '🔴 EN VIVO';
                         } else {
-                            $html_eventos .= '<span class="access-badge access-waiting">🔒 Pendiente</span>';
+                            $estado_icons = ['programado' => '📋', 'en_vivo' => '🔴', 'finalizado' => '✅'];
+                            $html_eventos .= ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']);
+                        }
+                        $html_eventos .= '</span>';
+                        
+                        if ($evento['duracion_tipica']) {
+                            $html_eventos .= '<small style="color: #6b7280; font-size: 11px;">⏱️ ~' . $evento['duracion_tipica'] . 'min</small>';
                         }
                         $html_eventos .= '</div>';
-                    } else {
-                        $html_eventos .= '<div class="tiempo-restante">📅 ' . formatTiempoRestante($tiempo_restante) . '</div>';
-                    }
 
-                    $html_eventos .= '</div></div>';
-
-                    // Equipos
-                    $html_eventos .= '<div class="event-teams">';
-                    if ($evento['equipo_local'] && $evento['equipo_visitante']) {
-                        $html_eventos .= '<div class="team">';
-                        $html_eventos .= '<div class="team-flag">' . strtoupper(substr($evento['equipo_local'], 0, 2)) . '</div>';
-                        $html_eventos .= '<span>' . htmlspecialchars($evento['equipo_local']) . '</span>';
                         $html_eventos .= '</div>';
-                        $html_eventos .= '<div class="vs">vs</div>';
-                        $html_eventos .= '<div class="team">';
-                        $html_eventos .= '<div class="team-flag">' . strtoupper(substr($evento['equipo_visitante'], 0, 2)) . '</div>';
-                        $html_eventos .= '<span>' . htmlspecialchars($evento['equipo_visitante']) . '</span>';
-                        $html_eventos .= '</div>';
-                    } else {
-                        $html_eventos .= '<div class="team"><span>' . htmlspecialchars($evento['titulo']) . '</span></div>';
-                    }
-                    $html_eventos .= '</div>';
-
-                    // Info adicional
-                    $html_eventos .= '<div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">';
-                    if ($evento['canal_nombre']) {
-                        $html_eventos .= '<div class="event-channel">📺 ' . htmlspecialchars($evento['canal_nombre']) . '</div>';
-                    }
-                    
-                    $html_eventos .= '<span class="event-status status-' . $evento['estado'] . '">';
-                    if ($es_live) {
-                        $html_eventos .= '🔴 EN VIVO';
-                    } else {
-                        $estado_icons = ['programado' => '📋', 'en_vivo' => '🔴', 'finalizado' => '✅'];
-                        $html_eventos .= ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']);
-                    }
-                    $html_eventos .= '</span>';
-                    
-                    if ($evento['duracion_tipica']) {
-                        $html_eventos .= '<small style="color: #6b7280; font-size: 11px;">⏱️ ~' . $evento['duracion_tipica'] . 'min</small>';
-                    }
-                    $html_eventos .= '</div>';
-
-                    $html_eventos .= '</div>';
-                    
-                    if ($enlace_disponible) {
-                        $html_eventos .= '</a>';
-                    } else {
+                        
+                        if ($enlace_disponible) {
+                            $html_eventos .= '</a>';
+                        } else {
+                            $html_eventos .= '</div>';
+                        }
+                        
                         $html_eventos .= '</div>';
                     }
                     
                     $html_eventos .= '</div>';
                 }
 
-                // Paginación
+                // Generar paginación
                 $total_paginas_ajax = ceil($total_eventos_ajax / $items_por_pagina);
                 $html_paginacion = '';
                 
@@ -355,7 +332,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $html_paginacion .= '<div class="pagination">';
                     
                     if ($pagina_ajax > 1) {
-                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . ($pagina_ajax - 1) . ')">← Anterior</a>';
+                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . ($pagina_ajax - 1) . '); return false;">← Anterior</a>';
                     } else {
                         $html_paginacion .= '<span class="disabled">← Anterior</span>';
                     }
@@ -363,16 +340,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $start = max(1, $pagina_ajax - 2);
                     $end = min($total_paginas_ajax, $pagina_ajax + 2);
                     
+                    if ($start > 1) {
+                        $html_paginacion .= '<a href="#" onclick="cargarPagina(1); return false;">1</a>';
+                        if ($start > 2) $html_paginacion .= '<span>...</span>';
+                    }
+                    
                     for ($i = $start; $i <= $end; $i++) {
                         if ($i == $pagina_ajax) {
                             $html_paginacion .= '<span class="current">' . $i . '</span>';
                         } else {
-                            $html_paginacion .= '<a href="#" onclick="cargarPagina(' . $i . ')">' . $i . '</a>';
+                            $html_paginacion .= '<a href="#" onclick="cargarPagina(' . $i . '); return false;">' . $i . '</a>';
                         }
+                    }
+                    
+                    if ($end < $total_paginas_ajax) {
+                        if ($end < $total_paginas_ajax - 1) $html_paginacion .= '<span>...</span>';
+                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . $total_paginas_ajax . '); return false;">' . $total_paginas_ajax . '</a>';
                     }
 
                     if ($pagina_ajax < $total_paginas_ajax) {
-                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . ($pagina_ajax + 1) . ')">Siguiente →</a>';
+                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . ($pagina_ajax + 1) . '); return false;">Siguiente →</a>';
                     } else {
                         $html_paginacion .= '<span class="disabled">Siguiente →</span>';
                     }
@@ -397,23 +384,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             
         case 'obtener_conteos':
             try {
-                $stmt_hoy = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) = CURDATE()");
+                // Conteo HOY - solo eventos futuros o en curso
+                $stmt_hoy = $db->prepare("
+                    SELECT COUNT(*) as total 
+                    FROM eventos e
+                    LEFT JOIN deportes d ON e.deporte_id = d.id
+                    WHERE DATE(e.fecha_evento) = CURDATE()
+                    AND (
+                        e.fecha_evento > NOW()
+                        OR
+                        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                    )
+                ");
                 $stmt_hoy->execute();
-                $count_hoy_ajax = $stmt_hoy->fetch()['total'];
+                $count_hoy_ajax = $stmt_hoy->fetch(PDO::FETCH_ASSOC)['total'];
 
-                $stmt_manana = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
+                // Conteo MAÑANA
+                $stmt_manana = $db->prepare("
+                    SELECT COUNT(*) as total 
+                    FROM eventos 
+                    WHERE DATE(fecha_evento) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+                ");
                 $stmt_manana->execute();
-                $count_manana_ajax = $stmt_manana->fetch()['total'];
+                $count_manana_ajax = $stmt_manana->fetch(PDO::FETCH_ASSOC)['total'];
 
-                $stmt_otros = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) > DATE_ADD(CURDATE(), INTERVAL 1 DAY) AND DATE(fecha_evento) <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)");
+                // Conteo OTROS
+                $stmt_otros = $db->prepare("
+                    SELECT COUNT(*) as total 
+                    FROM eventos 
+                    WHERE DATE(fecha_evento) > DATE_ADD(CURDATE(), INTERVAL 1 DAY) 
+                    AND DATE(fecha_evento) <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+                ");
                 $stmt_otros->execute();
-                $count_otros_ajax = $stmt_otros->fetch()['total'];
+                $count_otros_ajax = $stmt_otros->fetch(PDO::FETCH_ASSOC)['total'];
 
                 echo json_encode([
                     'success' => true,
                     'hoy' => $count_hoy_ajax,
                     'manana' => $count_manana_ajax,
                     'otros' => $count_otros_ajax
+                ]);
+            } catch (Exception $e) {
+                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+            }
+            exit;
+            
+        case 'obtener_competiciones_filtradas':
+            try {
+                $deporte_id = $_POST['deporte_id'] ?? null;
+                
+                if ($deporte_id) {
+                    $stmt = $db->prepare("SELECT id, nombre FROM competiciones WHERE deporte_id = ? ORDER BY nombre");
+                    $stmt->execute([$deporte_id]);
+                } else {
+                    $stmt = $db->prepare("SELECT id, nombre FROM competiciones ORDER BY nombre");
+                    $stmt->execute();
+                }
+                
+                $competiciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                
+                echo json_encode([
+                    'success' => true,
+                    'competiciones' => $competiciones
                 ]);
             } catch (Exception $e) {
                 echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -466,20 +498,30 @@ $canales = $canalModel->obtenerTodos();
 $competiciones = $competicionModel->obtenerTodos();
 
 // Conteos para botones
-$stmt_hoy = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) = CURDATE()");
+$stmt_hoy = $db->prepare("
+    SELECT COUNT(*) as total 
+    FROM eventos e
+    LEFT JOIN deportes d ON e.deporte_id = d.id
+    WHERE DATE(e.fecha_evento) = CURDATE()
+    AND (
+        e.fecha_evento > NOW()
+        OR
+        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+    )
+");
 $stmt_hoy->execute();
-$count_hoy = $stmt_hoy->fetch()['total'];
+$count_hoy = $stmt_hoy->fetch(PDO::FETCH_ASSOC)['total'];
 
 $stmt_manana = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
 $stmt_manana->execute();
-$count_manana = $stmt_manana->fetch()['total'];
+$count_manana = $stmt_manana->fetch(PDO::FETCH_ASSOC)['total'];
 
 $stmt_otros = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) > DATE_ADD(CURDATE(), INTERVAL 1 DAY) AND DATE(fecha_evento) <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)");
 $stmt_otros->execute();
-$count_otros = $stmt_otros->fetch()['total'];
+$count_otros = $stmt_otros->fetch(PDO::FETCH_ASSOC)['total'];
 
 // Cargar eventos iniciales
-$pagina = (int)($_GET['pagina'] ?? 1);
+$pagina = max(1, (int)($_GET['pagina'] ?? 1));
 $items_por_pagina = Config::ITEMS_PER_PAGE;
 $offset = ($pagina - 1) * $items_por_pagina;
 
@@ -493,18 +535,24 @@ $query_eventos = "SELECT e.*,
                          ch.logo as canal_logo,
                          TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) as minutos_hasta_evento,
                          CASE 
-                            WHEN NOW() >= e.fecha_evento AND NOW() <= DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                            WHEN NOW() BETWEEN e.fecha_evento 
+                            AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
                             THEN TRUE ELSE FALSE
                          END as en_vivo_calculado,
                          CASE 
-                            WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) <= 15 AND TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) >= -COALESCE(e.duracion_minutos, d.duracion_tipica, 90)
+                            WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) BETWEEN -COALESCE(e.duracion_minutos, d.duracion_tipica, 90) AND 15
                             THEN TRUE ELSE FALSE
                          END as enlace_activo
                   FROM eventos e
                   LEFT JOIN deportes d ON e.deporte_id = d.id
                   LEFT JOIN competiciones c ON e.competicion_id = c.id
                   LEFT JOIN canales ch ON e.canal_id = ch.id
-                  WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin";
+                  WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin
+                  AND (
+                      e.fecha_evento > NOW()
+                      OR
+                      NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                  )";
 
 $params = [
     ':fecha_inicio' => $fecha_inicio,
@@ -525,29 +573,35 @@ if (!empty($filtros['canal'])) {
     $params[':canal'] = $filtros['canal'];
 }
 if (!empty($filtros['buscar'])) {
-    $query_eventos .= " AND (e.titulo LIKE :buscar OR e.descripcion LIKE :buscar OR e.equipo_local LIKE :buscar OR e.equipo_visitante LIKE :buscar)";
-    $params[':buscar'] = '%' . $filtros['buscar'] . '%';
+    $query_eventos .= " AND (e.titulo LIKE :buscar OR e.descripcion LIKE :buscar2 OR e.equipo_local LIKE :buscar3 OR e.equipo_visitante LIKE :buscar4)";
+    $buscar_param = '%' . $filtros['buscar'] . '%';
+    $params[':buscar'] = $buscar_param;
+    $params[':buscar2'] = $buscar_param;
+    $params[':buscar3'] = $buscar_param;
+    $params[':buscar4'] = $buscar_param;
 }
 
-// Ordenar
-if ($filtros['dia'] == 'hoy') {
-    $query_eventos .= " ORDER BY 
-                        CASE 
-                            WHEN NOW() >= e.fecha_evento AND NOW() <= DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE) 
-                            THEN 0 
-                            ELSE 1 
-                        END,
-                        e.fecha_evento ASC";
-} else {
-    $query_eventos .= " ORDER BY e.fecha_evento ASC";
-}
+// Ordenar: eventos en vivo primero
+$query_eventos .= " ORDER BY 
+                    CASE 
+                        WHEN NOW() BETWEEN e.fecha_evento 
+                        AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                        THEN 0 
+                        ELSE 1 
+                    END,
+                    e.fecha_evento ASC";
 
 // Contar total
 $query_count = "SELECT COUNT(*) as total FROM eventos e
                 LEFT JOIN deportes d ON e.deporte_id = d.id
                 LEFT JOIN competiciones c ON e.competicion_id = c.id
                 LEFT JOIN canales ch ON e.canal_id = ch.id
-                WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin";
+                WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin
+                AND (
+                    e.fecha_evento > NOW()
+                    OR
+                    NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                )";
 
 if (!empty($filtros['deporte'])) {
     $query_count .= " AND e.deporte_id = :deporte";
@@ -559,7 +613,7 @@ if (!empty($filtros['canal'])) {
     $query_count .= " AND e.canal_id = :canal";
 }
 if (!empty($filtros['buscar'])) {
-    $query_count .= " AND (e.titulo LIKE :buscar OR e.descripcion LIKE :buscar OR e.equipo_local LIKE :buscar OR e.equipo_visitante LIKE :buscar)";
+    $query_count .= " AND (e.titulo LIKE :buscar OR e.descripcion LIKE :buscar2 OR e.equipo_local LIKE :buscar3 OR e.equipo_visitante LIKE :buscar4)";
 }
 
 $stmt_count = $db->prepare($query_count);
@@ -602,8 +656,8 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SportEvents - <?= $titulo_seccion ?></title>
-    <meta name="description" content="Encuentra todos los eventos deportivos por día. Fútbol, baloncesto, tenis y más deportes.">
+    <title>FutbolTV.su - <?= $titulo_seccion ?></title>
+    <meta name="description" content="Encuentra todos los eventos deportivos por día. Fútbol, baloncesto, tenis y más deportes en vivo.">
     <style>
         * {
             margin: 0;
@@ -806,6 +860,7 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             padding: 25px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             position: relative;
+            min-height: 400px;
         }
 
         .events-header {
@@ -997,74 +1052,13 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             font-size: 14px;
             color: #6b7280;
             margin-bottom: 8px;
+            flex-wrap: wrap;
         }
 
         .tiempo-restante {
             font-size: 12px;
             color: #6b7280;
             font-weight: 500;
-        }
-
-        .access-info {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-top: 8px;
-        }
-
-        .access-badge {
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 500;
-        }
-
-        .access-available {
-            background: #dcfce7;
-            color: #166534;
-        }
-
-        .access-soon {
-            background: #fef3c7;
-            color: #92400e;
-        }
-
-        .access-waiting {
-            background: #f3f4f6;
-            color: #6b7280;
-        }
-
-        .event-teams {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            min-width: 300px;
-        }
-
-        .team {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-weight: 500;
-        }
-
-        .team-flag {
-            width: 28px;
-            height: 28px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, #e5e7eb, #d1d5db);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 12px;
-            font-weight: bold;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-
-        .vs {
-            color: #9ca3af;
-            font-weight: 400;
-            font-size: 14px;
         }
 
         .event-status {
@@ -1221,11 +1215,6 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             to { opacity: 1; transform: translateY(0); }
         }
 
-        .search-active {
-            background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
-            border-color: #0ea5e9 !important;
-        }
-
         /* Responsive */
         @media (max-width: 768px) {
             .container { padding: 15px; }
@@ -1235,14 +1224,15 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             .filters-grid { grid-template-columns: 1fr; }
             .event-card { flex-direction: column; align-items: stretch; gap: 15px; }
             .event-left { flex-direction: column; align-items: stretch; gap: 10px; }
-            .event-teams { justify-content: center; min-width: auto; }
             .events-header { flex-direction: column; align-items: stretch; gap: 10px; }
         }
 
         @media (max-width: 480px) {
             .header-left h1 { font-size: 1.8rem; }
-            .event-teams { flex-direction: column; gap: 10px; }
             .filter-actions { justify-content: center; }
+            .event-details { font-size: 13px; }
+            .pagination { flex-wrap: wrap; }
+            .pagination a, .pagination span { padding: 8px 12px; font-size: 14px; }
         }
     </style>
 </head>
@@ -1252,10 +1242,9 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
         <div class="header">
             <div class="header-content">
                 <div class="header-left">
-                    <h1>🏆 SportEvents</h1>
-                    <div class="subtitle"><?= $titulo_seccion ?> - <?= $subtitulo ?></div>
+                    <h1>FutbolTV.su</h1>
+                    <div class="subtitle">Deportes en directo</div>
                 </div>
-                <a href="admin.php" class="admin-link">⚙️ Panel Admin</a>
             </div>
         </div>
 
@@ -1464,40 +1453,12 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                                                         🔴 Transmisión en vivo
                                                     </div>
                                                 <?php endif; ?>
-                                                
-                                                <div class="access-info">
-                                                    <?php if ($enlace_disponible): ?>
-                                                        <span class="access-badge access-available">✅ Acceso disponible</span>
-                                                    <?php elseif ($tiempo_restante <= 30): ?>
-                                                        <span class="access-badge access-soon">⏱️ Próximamente</span>
-                                                    <?php else: ?>
-                                                        <span class="access-badge access-waiting">🔒 Pendiente</span>
-                                                    <?php endif; ?>
-                                                </div>
                                             <?php else: ?>
                                                 <div class="tiempo-restante">
                                                     📅 <?= formatTiempoRestante($tiempo_restante) ?>
                                                 </div>
                                             <?php endif; ?>
                                         </div>
-                                    </div>
-
-                                    <div class="event-teams">
-                                        <?php if ($evento['equipo_local'] && $evento['equipo_visitante']): ?>
-                                            <div class="team">
-                                                <div class="team-flag"><?= strtoupper(substr($evento['equipo_local'], 0, 2)) ?></div>
-                                                <span><?= htmlspecialchars($evento['equipo_local']) ?></span>
-                                            </div>
-                                            <div class="vs">vs</div>
-                                            <div class="team">
-                                                <div class="team-flag"><?= strtoupper(substr($evento['equipo_visitante'], 0, 2)) ?></div>
-                                                <span><?= htmlspecialchars($evento['equipo_visitante']) ?></span>
-                                            </div>
-                                        <?php else: ?>
-                                            <div class="team">
-                                                <span><?= htmlspecialchars($evento['titulo']) ?></span>
-                                            </div>
-                                        <?php endif; ?>
                                     </div>
 
                                     <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
@@ -1509,14 +1470,8 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                                             <?php if ($es_live): ?>
                                                 🔴 EN VIVO
                                             <?php else: ?>
-                                                <?php 
-                                                $estado_icons = [
-                                                    'programado' => '📋',
-                                                    'en_vivo' => '🔴',
-                                                    'finalizado' => '✅'
-                                                ];
-                                                echo ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']);
-                                                ?>
+                                                <?php $estado_icons = ['programado' => '📋', 'en_vivo' => '🔴', 'finalizado' => '✅']; ?>
+                                                <?= ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']) ?>
                                             <?php endif; ?>
                                         </span>
                                         
@@ -1542,7 +1497,7 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                         <?php if ($total_paginas > 1): ?>
                         <div class="pagination">
                             <?php if ($pagina > 1): ?>
-                                <a href="#" onclick="cargarPagina(<?= $pagina - 1 ?>)">← Anterior</a>
+                                <a href="#" onclick="cargarPagina(<?= $pagina - 1 ?>); return false;">← Anterior</a>
                             <?php else: ?>
                                 <span class="disabled">← Anterior</span>
                             <?php endif; ?>
@@ -1551,17 +1506,27 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                             $start = max(1, $pagina - 2);
                             $end = min($total_paginas, $pagina + 2);
                             
+                            if ($start > 1) {
+                                echo '<a href="#" onclick="cargarPagina(1); return false;">1</a>';
+                                if ($start > 2) echo '<span>...</span>';
+                            }
+                            
                             for ($i = $start; $i <= $end; $i++):
                             ?>
                                 <?php if ($i == $pagina): ?>
                                     <span class="current"><?= $i ?></span>
                                 <?php else: ?>
-                                    <a href="#" onclick="cargarPagina(<?= $i ?>)"><?= $i ?></a>
+                                    <a href="#" onclick="cargarPagina(<?= $i ?>); return false;"><?= $i ?></a>
                                 <?php endif; ?>
                             <?php endfor; ?>
+                            
+                            <?php if ($end < $total_paginas): ?>
+                                <?php if ($end < $total_paginas - 1) echo '<span>...</span>'; ?>
+                                <a href="#" onclick="cargarPagina(<?= $total_paginas ?>); return false;"><?= $total_paginas ?></a>
+                            <?php endif; ?>
 
                             <?php if ($pagina < $total_paginas): ?>
-                                <a href="#" onclick="cargarPagina(<?= $pagina + 1 ?>)">Siguiente →</a>
+                                <a href="#" onclick="cargarPagina(<?= $pagina + 1 ?>); return false;">Siguiente →</a>
                             <?php else: ?>
                                 <span class="disabled">Siguiente →</span>
                             <?php endif; ?>
@@ -1613,7 +1578,7 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                 const result = await response.json();
 
                 if (result.success) {
-                    document.getElementById('events-list').innerHTML = result.html;
+                    document.getElementById('eventos-container').innerHTML = result.html;
                     document.getElementById('paginacion-container').innerHTML = result.paginacion;
                     
                     let contadorTexto = result.total + ' evento' + (result.total != 1 ? 's' : '');
@@ -1624,22 +1589,22 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
 
                     currentPage = result.pagina_actual;
 
+                    // Animaciones de entrada
                     const eventCards = document.querySelectorAll('.event-card-wrapper');
                     eventCards.forEach((card, index) => {
                         card.classList.add('fade-in');
-                        card.style.animationDelay = `${index * 0.1}s`;
+                        card.style.animationDelay = `${index * 0.05}s`;
                     });
 
-                    inicializarEventosCards();
-
-                    if (result.total === 0) {
-                        mostrarMensajeVacio();
+                    // Scroll suave al contenedor
+                    if (pagina !== currentPage) {
+                        document.querySelector('.events-section').scrollIntoView({ 
+                            behavior: 'smooth', 
+                            block: 'start' 
+                        });
                     }
 
-                    document.querySelector('.events-section').scrollIntoView({ 
-                        behavior: 'smooth', 
-                        block: 'start' 
-                    });
+                    actualizarConteosDias();
                 }
             } catch (error) {
                 console.error('Error al filtrar eventos:', error);
@@ -1652,46 +1617,61 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             }
         }
 
-        function mostrarCargando(mostrar) {
-            const overlay = document.getElementById('loading-overlay');
-            if (mostrar) {
-                overlay.style.display = 'flex';
-            } else {
-                overlay.style.display = 'none';
+        // Actualizar conteos de días
+        async function actualizarConteosDias() {
+            try {
+                const response = await fetch('index.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({ action: 'obtener_conteos' })
+                });
+
+                const result = await response.json();
+                
+                if (result.success) {
+                    document.querySelector('.day-btn:nth-child(1) .count').textContent = result.hoy;
+                    document.querySelector('.day-btn:nth-child(2) .count').textContent = result.manana;
+                    document.querySelector('.day-btn:nth-child(3) .count').textContent = result.otros;
+                }
+            } catch (error) {
+                console.error('Error al actualizar conteos:', error);
             }
         }
 
+        // Mostrar/ocultar cargando
+        function mostrarCargando(mostrar) {
+            const overlay = document.getElementById('loading-overlay');
+            overlay.style.display = mostrar ? 'flex' : 'none';
+        }
+
+        // Cargar página
         function cargarPagina(pagina) {
-            event.preventDefault();
             filtrarEventos(pagina);
         }
 
-        function mostrarMensajeVacio() {
-            const diaActual = document.getElementById('dia-actual').value;
-            let icono = '📅';
-            let mensaje = 'próximos';
+        // Cambiar día
+        function cambiarDia(dia) {
+            document.getElementById('dia-actual').value = dia;
             
-            if (diaActual === 'hoy') {
-                icono = '😴';
-                mensaje = 'hoy';
-            } else if (diaActual === 'manana') {
-                icono = '🌙';
-                mensaje = 'mañana';
-            }
-
-            const html = `
-                <div class="no-events fade-in">
-                    <div class="no-events-icon">${icono}</div>
-                    <h3>No hay eventos ${mensaje}</h3>
-                    <p>No se encontraron eventos con los filtros aplicados.</p>
-                    <p>Prueba ajustando los filtros o revisa en otro día.</p>
-                </div>
-            `;
+            // Actualizar botones activos
+            document.querySelectorAll('.day-btn').forEach(btn => btn.classList.remove('active'));
+            event.currentTarget.classList.add('active');
             
-            document.getElementById('events-list').innerHTML = html;
-            document.getElementById('paginacion-container').innerHTML = '';
+            // Actualizar título
+            const titulos = {
+                'hoy': '📅 Eventos de Hoy',
+                'manana': '🌅 Eventos de Mañana',
+                'otros': '📆 Próximos Eventos'
+            };
+            document.querySelector('#titulo-seccion').textContent = titulos[dia];
+            
+            currentPage = 1;
+            filtrarEventos(1);
         }
 
+        // Mostrar error
         function mostrarError(mensaje) {
             const html = `
                 <div class="no-events fade-in">
@@ -1701,222 +1681,103 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                 </div>
             `;
             
-            document.getElementById('events-list').innerHTML = html;
-            document.getElementById('paginacion-container').innerHTML = '';
+            document.getElementById('eventos-container').innerHTML = html;
         }
 
-        async function cargarCompeticionesFiltro(deporteId) {
+        // Actualizar competiciones según deporte
+        async function actualizarCompeticiones() {
+            const deporteId = document.getElementById('deporte').value;
             const competicionSelect = document.getElementById('competicion');
+            const competicionActual = competicionSelect.value;
             
-            competicionSelect.innerHTML = '<option value="">Cargando...</option>';
-            competicionSelect.disabled = true;
-            
+            // Si no hay deporte seleccionado, mostrar todas
             if (!deporteId) {
-                competicionSelect.innerHTML = '<option value="">Todas las competiciones</option>';
-                competicionSelect.disabled = false;
+                // Mostrar todas las opciones
+                Array.from(competicionSelect.options).forEach(option => {
+                    if (option.value) {
+                        option.style.display = '';
+                    }
+                });
                 return;
             }
             
-            try {
-                const response = await fetch('index.php', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: `action=obtener_competiciones&deporte_id=${deporteId}`
-                });
-                
-                const result = await response.json();
-                
-                competicionSelect.innerHTML = '<option value="">Todas las competiciones</option>';
-                
-                if (result.success) {
-                    result.competiciones.forEach(comp => {
-                        const option = document.createElement('option');
-                        option.value = comp.id;
-                        option.textContent = comp.nombre;
-                        competicionSelect.appendChild(option);
-                    });
-                }
-            } catch (error) {
-                console.error('Error al cargar competiciones:', error);
-            } finally {
-                competicionSelect.disabled = false;
-            }
-        }
-
-        function limpiarFiltros() {
-            document.getElementById('buscar').value = '';
-            document.getElementById('deporte').value = '';
-            document.getElementById('competicion').value = '';
-            document.getElementById('canal').value = '';
-            
-            document.getElementById('competicion').innerHTML = '<option value="">Todas las competiciones</option>';
-            
-            filtrarEventos(1);
-        }
-
-        function inicializarEventosCards() {
-            const enlacesDisponibles = document.querySelectorAll('.event-link:not(.disabled)');
-            enlacesDisponibles.forEach(enlace => {
-                enlace.addEventListener('mouseenter', function() {
-                    const card = this.querySelector('.event-card');
-                    card.style.transform = 'translateY(-4px)';
-                });
-                
-                enlace.addEventListener('mouseleave', function() {
-                    const card = this.querySelector('.event-card');
-                    card.style.transform = 'translateY(0)';
-                });
-            });
-
-            const enlacesDeshabilitados = document.querySelectorAll('.event-link.disabled');
-            enlacesDeshabilitados.forEach(enlace => {
-                enlace.addEventListener('click', function(e) {
-                    e.preventDefault();
-                    const card = this.querySelector('.event-card');
-                    const titulo = card.querySelector('.event-title').textContent;
-                    alert(`📅 El evento "${titulo}" estará disponible 15 minutos antes de su inicio.`);
-                });
-            });
-        }
-
-        function cambiarDia(nuevoDia) {
-            document.getElementById('dia-actual').value = nuevoDia;
-            
-            // Actualizar botones activos
-            document.querySelectorAll('.day-btn').forEach(btn => {
-                btn.classList.remove('active');
-            });
-            document.querySelector(`[onclick="cambiarDia('${nuevoDia}')"]`).classList.add('active');
-            
-            // Actualizar título
-            const titulos = {
-                'hoy': '📅 Eventos de Hoy',
-                'manana': '🌅 Eventos de Mañana',
-                'otros': '📆 Próximos Eventos'
-            };
-            document.getElementById('titulo-seccion').innerHTML = titulos[nuevoDia];
-            
-            filtrarEventos(1);
-        }
-
-        async function actualizarConteosBotones() {
-            try {
-                const response = await fetch('index.php', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: 'action=obtener_conteos'
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    document.querySelector('.day-btn[onclick="cambiarDia(\'hoy\')"] .count').textContent = data.hoy;
-                    document.querySelector('.day-btn[onclick="cambiarDia(\'manana\')"] .count').textContent = data.manana;
-                    document.querySelector('.day-btn[onclick="cambiarDia(\'otros\')"] .count').textContent = data.otros;
-                }
-            } catch (error) {
-                console.error('Error al actualizar conteos:', error);
-            }
-        }
-
-        function actualizarTiempoReal() {
-            const diaActual = document.getElementById('dia-actual').value;
-            
-            if (diaActual === 'hoy') {
-                const countdownBadges = document.querySelectorAll('.countdown-badge');
-                let debeRecargar = false;
-                
-                countdownBadges.forEach(badge => {
-                    let minutos = parseInt(badge.textContent);
-                    if (minutos > 0) {
-                        minutos--;
-                        badge.textContent = minutos + 'min';
-                        
-                        if (minutos === 0) {
-                            debeRecargar = true;
+            // Filtrar opciones según el deporte
+            let hayCompeticiones = false;
+            Array.from(competicionSelect.options).forEach(option => {
+                if (option.value) {
+                    const deporteOption = option.getAttribute('data-deporte');
+                    if (deporteOption === deporteId) {
+                        option.style.display = '';
+                        hayCompeticiones = true;
+                    } else {
+                        option.style.display = 'none';
+                        // Si la competición actual no corresponde al deporte, resetear
+                        if (option.value === competicionActual) {
+                            competicionSelect.value = '';
                         }
                     }
-                });
-                
-                if (debeRecargar) {
-                    filtrarEventos(currentPage, false);
                 }
+            });
+            
+            if (!hayCompeticiones) {
+                competicionSelect.innerHTML = '<option value="">No hay competiciones</option>';
             }
         }
 
-        // Inicialización
+        // Event listeners
         document.addEventListener('DOMContentLoaded', function() {
+            // Búsqueda con debounce
             const searchInput = document.getElementById('buscar');
             searchInput.addEventListener('input', function() {
                 clearTimeout(searchTimeout);
-                
-                if (this.value.length > 0) {
-                    this.classList.add('search-active');
-                    document.getElementById('search-loading').style.display = 'flex';
-                } else {
-                    this.classList.remove('search-active');
-                    document.getElementById('search-loading').style.display = 'none';
-                }
+                document.getElementById('search-loading').style.display = 'flex';
                 
                 searchTimeout = setTimeout(() => {
                     document.getElementById('search-loading').style.display = 'none';
+                    currentPage = 1;
                     filtrarEventos(1, false);
                 }, 500);
             });
 
-            const filtros = ['deporte', 'competicion', 'canal'];
-            filtros.forEach(filtro => {
-                document.getElementById(filtro).addEventListener('change', function() {
-                    clearTimeout(filterTimeout);
-                    
-                    document.getElementById('filter-loading').style.display = 'flex';
-                    
-                    filterTimeout = setTimeout(() => {
-                        document.getElementById('filter-loading').style.display = 'none';
-                        
-                        if (filtro === 'deporte') {
-                            cargarCompeticionesFiltro(this.value).then(() => {
-                                filtrarEventos(1, false);
-                            });
-                        } else {
-                            filtrarEventos(1, false);
-                        }
-                    }, 300);
+            // Filtros
+            const selectores = ['deporte', 'competicion', 'canal'];
+            selectores.forEach(id => {
+                document.getElementById(id).addEventListener('change', function() {
+                    if (id === 'deporte') {
+                        actualizarCompeticiones();
+                    }
+                    currentPage = 1;
+                    filtrarEventos(1);
                 });
             });
 
-            document.getElementById('limpiar-filtros').addEventListener('click', limpiarFiltros);
+            // Limpiar filtros
+            document.getElementById('limpiar-filtros').addEventListener('click', function() {
+                document.getElementById('buscar').value = '';
+                document.getElementById('deporte').value = '';
+                document.getElementById('competicion').value = '';
+                document.getElementById('canal').value = '';
+                actualizarCompeticiones();
+                currentPage = 1;
+                filtrarEventos(1);
+            });
 
-            inicializarEventosCards();
+            // Actualizar cada 30 segundos si hay eventos en vivo
+            setInterval(() => {
+                const liveCount = document.querySelector('.live-count');
+                if (liveCount && !isLoading) {
+                    filtrarEventos(currentPage, false);
+                }
+            }, 30000);
 
-            const deporteSelect = document.getElementById('deporte');
-            if (deporteSelect.value) {
-                cargarCompeticionesFiltro(deporteSelect.value);
-            }
+            // Inicializar competiciones
+            actualizarCompeticiones();
+        });
 
-            const diaActual = document.getElementById('dia-actual').value;
-            
-            if (diaActual === 'hoy') {
-                setInterval(actualizarTiempoReal, 60000);
-                
-                setInterval(() => {
-                    const eventosEnVivo = document.querySelectorAll('.event-time.live').length;
-                    const eventosProximos = document.querySelectorAll('.countdown-badge').length;
-                    
-                    if (eventosEnVivo > 0 || eventosProximos > 0) {
-                        filtrarEventos(currentPage, false);
-                    }
-                }, 120000);
-            }
-
-            setInterval(actualizarConteosBotones, 300000);
-
-            if (diaActual === 'hoy' && 'Notification' in window && Notification.permission === 'default') {
-                Notification.requestPermission();
+        // Prevenir comportamiento por defecto de enlaces
+        document.addEventListener('click', function(e) {
+            if (e.target.matches('.pagination a')) {
+                e.preventDefault();
             }
         });
     </script>
