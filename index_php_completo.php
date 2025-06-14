@@ -136,12 +136,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                               LEFT JOIN deportes d ON e.deporte_id = d.id
                               LEFT JOIN competiciones c ON e.competicion_id = c.id
                               LEFT JOIN canales ch ON e.canal_id = ch.id
-                              WHERE e.fecha_evento BETWEEN ? AND ?
-                              AND (
-                                  e.fecha_evento > NOW()
-                                  OR
-                                  NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                              )";
+                              WHERE e.fecha_evento BETWEEN ? AND ?";
+                
+                // Solo aplicar filtro de eventos no finalizados para "hoy"
+                if ($filtros_ajax['dia'] == 'hoy') {
+                    $query_ajax .= " AND (
+                        e.fecha_evento > NOW()
+                        OR
+                        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                    )";
+                }
 
                 $params_ajax = [$fecha_inicio, $fecha_fin];
 
@@ -161,7 +165,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 if (!empty($filtros_ajax['buscar'])) {
                     $query_ajax .= " AND (e.titulo LIKE ? OR e.descripcion LIKE ? OR e.equipo_local LIKE ? OR e.equipo_visitante LIKE ?)";
                     $buscar_param = '%' . $filtros_ajax['buscar'] . '%';
-                    array_push($params_ajax, $buscar_param, $buscar_param, $buscar_param, $buscar_param);
+                    $params_ajax[] = $buscar_param;
+                    $params_ajax[] = $buscar_param;
+                    $params_ajax[] = $buscar_param;
+                    $params_ajax[] = $buscar_param;
                 }
 
                 // Ordenar: eventos en vivo primero, luego por fecha
@@ -175,17 +182,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                                 e.fecha_evento ASC";
 
                 // Contar total sin límites
-                $query_count_ajax = str_replace(
-                    "SELECT e.*, d.nombre as deporte_nombre, d.icono as deporte_icono, d.duracion_tipica, c.nombre as competicion_nombre, c.pais as competicion_pais, ch.nombre as canal_nombre, ch.logo as canal_logo, TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) as minutos_hasta_evento, CASE WHEN NOW() BETWEEN e.fecha_evento AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE) THEN TRUE ELSE FALSE END as en_vivo_calculado, CASE WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) BETWEEN -COALESCE(e.duracion_minutos, d.duracion_tipica, 90) AND 15 THEN TRUE ELSE FALSE END as enlace_activo",
-                    "SELECT COUNT(*) as total",
-                    $query_ajax
-                );
+                $query_count_ajax = "SELECT COUNT(*) as total FROM eventos e
+                                    LEFT JOIN deportes d ON e.deporte_id = d.id
+                                    LEFT JOIN competiciones c ON e.competicion_id = c.id
+                                    LEFT JOIN canales ch ON e.canal_id = ch.id
+                                    WHERE e.fecha_evento BETWEEN ? AND ?";
                 
-                // Remover ORDER BY del count
-                $query_count_ajax = preg_replace('/ORDER BY.*$/s', '', $query_count_ajax);
+                // Solo aplicar filtro de eventos no finalizados para "hoy"
+                if ($filtros_ajax['dia'] == 'hoy') {
+                    $query_count_ajax .= " AND (
+                        e.fecha_evento > NOW()
+                        OR
+                        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+                    )";
+                }
+                
+                $params_count = [$fecha_inicio, $fecha_fin];
+                
+                if (!empty($filtros_ajax['deporte'])) {
+                    $query_count_ajax .= " AND e.deporte_id = ?";
+                    $params_count[] = $filtros_ajax['deporte'];
+                }
+                if (!empty($filtros_ajax['competicion'])) {
+                    $query_count_ajax .= " AND e.competicion_id = ?";
+                    $params_count[] = $filtros_ajax['competicion'];
+                }
+                if (!empty($filtros_ajax['canal'])) {
+                    $query_count_ajax .= " AND e.canal_id = ?";
+                    $params_count[] = $filtros_ajax['canal'];
+                }
+                if (!empty($filtros_ajax['buscar'])) {
+                    $query_count_ajax .= " AND (e.titulo LIKE ? OR e.descripcion LIKE ? OR e.equipo_local LIKE ? OR e.equipo_visitante LIKE ?)";
+                    $buscar_param = '%' . $filtros_ajax['buscar'] . '%';
+                    $params_count[] = $buscar_param;
+                    $params_count[] = $buscar_param;
+                    $params_count[] = $buscar_param;
+                    $params_count[] = $buscar_param;
+                }
                 
                 $stmt_count_ajax = $db->prepare($query_count_ajax);
-                $stmt_count_ajax->execute($params_ajax);
+                $stmt_count_ajax->execute($params_count);
                 $total_eventos_ajax = $stmt_count_ajax->fetch(PDO::FETCH_ASSOC)['total'];
 
                 // Aplicar paginación
@@ -547,12 +583,16 @@ $query_eventos = "SELECT e.*,
                   LEFT JOIN deportes d ON e.deporte_id = d.id
                   LEFT JOIN competiciones c ON e.competicion_id = c.id
                   LEFT JOIN canales ch ON e.canal_id = ch.id
-                  WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin
-                  AND (
-                      e.fecha_evento > NOW()
-                      OR
-                      NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                  )";
+                  WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin";
+
+// Solo aplicar filtro de eventos no finalizados para "hoy"
+if ($filtros['dia'] == 'hoy') {
+    $query_eventos .= " AND (
+        e.fecha_evento > NOW()
+        OR
+        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+    )";
+}
 
 $params = [
     ':fecha_inicio' => $fecha_inicio,
@@ -596,12 +636,16 @@ $query_count = "SELECT COUNT(*) as total FROM eventos e
                 LEFT JOIN deportes d ON e.deporte_id = d.id
                 LEFT JOIN competiciones c ON e.competicion_id = c.id
                 LEFT JOIN canales ch ON e.canal_id = ch.id
-                WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin
-                AND (
-                    e.fecha_evento > NOW()
-                    OR
-                    NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                )";
+                WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin";
+
+// Solo aplicar filtro de eventos no finalizados para "hoy"
+if ($filtros['dia'] == 'hoy') {
+    $query_count .= " AND (
+        e.fecha_evento > NOW()
+        OR
+        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+    )";
+}
 
 if (!empty($filtros['deporte'])) {
     $query_count .= " AND e.deporte_id = :deporte";
