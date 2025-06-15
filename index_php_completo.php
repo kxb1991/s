@@ -135,7 +135,7 @@ $competiciones = $competicionModel->obtenerTodos();
 
 // Conteos para botones de día
 try {
-    // Conteo HOY - solo eventos futuros o en curso
+    // Conteo HOY - solo eventos futuros o en curso (incluyendo 30 min después)
     $stmt_hoy = $db->prepare("
         SELECT COUNT(*) as total 
         FROM eventos e
@@ -144,7 +144,7 @@ try {
         AND (
             e.fecha_evento > NOW()
             OR
-            NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+            NOW() < DATE_ADD(e.fecha_evento, INTERVAL (COALESCE(e.duracion_minutos, d.duracion_tipica, 90) + 30) MINUTE)
         )
     ");
     $stmt_hoy->execute();
@@ -186,9 +186,14 @@ $query_eventos = "SELECT e.*,
                             THEN TRUE ELSE FALSE
                          END as en_vivo_calculado,
                          CASE 
-                            WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) BETWEEN -COALESCE(e.duracion_minutos, d.duracion_tipica, 90) AND 15
+                            WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) >= -30 
+                            AND TIMESTAMPDIFF(MINUTE, NOW(), DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)) >= -30
                             THEN TRUE ELSE FALSE
-                         END as enlace_activo
+                         END as enlace_activo,
+                         CASE 
+                            WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) BETWEEN -30 AND 30
+                            THEN TRUE ELSE FALSE
+                         END as proximo_a_empezar
                   FROM eventos e
                   LEFT JOIN deportes d ON e.deporte_id = d.id
                   LEFT JOIN competiciones c ON e.competicion_id = c.id
@@ -196,11 +201,12 @@ $query_eventos = "SELECT e.*,
                   WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin";
 
 // Solo aplicar filtro de eventos no finalizados para "hoy"
+// Ahora incluimos eventos que terminaron hace menos de 30 minutos
 if ($filtros['dia'] == 'hoy') {
     $query_eventos .= " AND (
         e.fecha_evento > NOW()
         OR
-        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+        NOW() < DATE_ADD(e.fecha_evento, INTERVAL (COALESCE(e.duracion_minutos, d.duracion_tipica, 90) + 30) MINUTE)
     )";
 }
 
@@ -249,11 +255,12 @@ $query_count = "SELECT COUNT(*) as total FROM eventos e
                 WHERE e.fecha_evento BETWEEN :fecha_inicio AND :fecha_fin";
 
 // Solo aplicar filtro de eventos no finalizados para "hoy"
+// Ahora incluimos eventos que terminaron hace menos de 30 minutos
 if ($filtros['dia'] == 'hoy') {
     $query_count .= " AND (
         e.fecha_evento > NOW()
         OR
-        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+        NOW() < DATE_ADD(e.fecha_evento, INTERVAL (COALESCE(e.duracion_minutos, d.duracion_tipica, 90) + 30) MINUTE)
     )";
 }
 
@@ -966,10 +973,20 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                 <div class="events-list">
                     <?php foreach ($eventos as $evento): ?>
                     <?php 
-                        $enlace_disponible = $evento['enlace_activo'] || $evento['en_vivo_calculado'];
+                        // El enlace está disponible 30 min antes y hasta 30 min después de terminar
+                        $enlace_disponible = $evento['enlace_activo'];
                         $es_live = $evento['en_vivo_calculado'];
                         $tiempo_restante = $evento['minutos_hasta_evento'];
-                        $clase_tiempo = $es_live ? 'live' : ($tiempo_restante <= 15 && $tiempo_restante > 0 ? 'soon' : '');
+                        $proximo = $evento['proximo_a_empezar'] ?? false;
+                        
+                        // Clases CSS según estado
+                        $clase_tiempo = '';
+                        if ($es_live) {
+                            $clase_tiempo = 'live';
+                        } elseif ($tiempo_restante <= 30 && $tiempo_restante > 0) {
+                            $clase_tiempo = 'soon';
+                        }
+                        
                         $clase_card = $es_live ? 'live-event' : '';
                         
                         // Asegurar token
@@ -993,7 +1010,7 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                                             <div class="live-indicator">●</div>
                                         <?php else: ?>
                                             <?= date('H:i', strtotime($evento['fecha_evento'])) ?>
-                                            <?php if ($tiempo_restante <= 15 && $tiempo_restante > 0): ?>
+                                            <?php if ($tiempo_restante <= 30 && $tiempo_restante > 0): ?>
                                                 <span class="countdown-badge" style="position: absolute; top: -8px; right: -8px; background: #f59e0b; color: white; padding: 2px 6px; border-radius: 10px; font-size: 10px;"><?= $tiempo_restante ?>min</span>
                                             <?php endif; ?>
                                         <?php endif; ?>
@@ -1016,13 +1033,16 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                                             <?php if ($filtros['dia'] != 'hoy'): ?>
                                                 <span>• 📅 <?= Config::formatDate($evento['fecha_evento'], 'd/m/Y') ?></span>
                                             <?php endif; ?>
+                                            <?php if ($evento['duracion_tipica']): ?>
+                                                <span style="color: #9ca3af; font-size: 12px;">• ⏱️ ~<?= $evento['duracion_tipica'] ?>min</span>
+                                            <?php endif; ?>
                                         </div>
                                         
                                         <?php if ($filtros['dia'] == 'hoy'): ?>
                                             <?php if (!$es_live && $tiempo_restante > 0): ?>
                                                 <div class="tiempo-restante">
-                                                    <?php if ($tiempo_restante <= 15): ?>
-                                                        ⚡ Disponible en <?= $tiempo_restante ?> minutos
+                                                    <?php if ($tiempo_restante <= 30): ?>
+                                                        ⚡ Enlace disponible<?= $tiempo_restante <= 15 ? ' ahora' : ' en ' . $tiempo_restante . ' minutos' ?>
                                                     <?php else: ?>
                                                         🕒 Comienza en <?= formatTiempoRestante($tiempo_restante) ?>
                                                     <?php endif; ?>
@@ -1031,10 +1051,17 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                                                 <div class="tiempo-restante" style="color: #ef4444; font-weight: 600;">
                                                     🔴 Transmisión en vivo
                                                 </div>
+                                            <?php elseif ($tiempo_restante < 0 && $enlace_disponible): ?>
+                                                <div class="tiempo-restante" style="color: #10b981; font-weight: 600;">
+                                                    ✅ Evento en curso/finalizado (enlace activo)
+                                                </div>
                                             <?php endif; ?>
                                         <?php else: ?>
                                             <div class="tiempo-restante">
                                                 📅 <?= formatTiempoRestante($tiempo_restante) ?>
+                                                <?php if ($tiempo_restante <= 30 && $tiempo_restante > -30): ?>
+                                                    <span style="color: #f59e0b; font-weight: 500;"> • Enlace disponible</span>
+                                                <?php endif; ?>
                                             </div>
                                         <?php endif; ?>
                                     </div>
@@ -1048,17 +1075,13 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                                     <span class="event-status status-<?= $evento['estado'] ?>">
                                         <?php if ($es_live): ?>
                                             🔴 EN VIVO
+                                        <?php elseif ($enlace_disponible && $tiempo_restante < 0): ?>
+                                            ✅ FINALIZADO
                                         <?php else: ?>
                                             <?php $estado_icons = ['programado' => '📋', 'en_vivo' => '🔴', 'finalizado' => '✅']; ?>
                                             <?= ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']) ?>
                                         <?php endif; ?>
                                     </span>
-                                    
-                                    <?php if ($evento['duracion_tipica']): ?>
-                                        <small style="color: #6b7280; font-size: 11px;">
-                                            ⏱️ ~<?= $evento['duracion_tipica'] ?>min
-                                        </small>
-                                    <?php endif; ?>
                                 </div>
                             </div>
                         
