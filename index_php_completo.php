@@ -6,6 +6,19 @@ require_once 'models/DeporteModel.php';
 require_once 'models/CanalModel.php';
 require_once 'models/CompeticionModel.php';
 
+// Limpiar parámetros vacíos de la URL
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['filtrar'])) {
+    $params = array_filter($_GET, function($value) {
+        return $value !== '' && $value !== null;
+    });
+    unset($params['filtrar']);
+    
+    if (count($params) !== count($_GET) - 1) {
+        header('Location: index.php?' . http_build_query($params));
+        exit;
+    }
+}
+
 // Configuración si no existe la clase Config
 if (!class_exists('Config')) {
     class Config {
@@ -845,7 +858,7 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
 
         <!-- Filtros -->
         <div class="filters">
-            <form method="get" action="" class="filters-form">
+            <form method="get" action="index.php" class="filters-form">
                 <input type="hidden" name="dia" value="<?= htmlspecialchars($filtros['dia']) ?>">
                 
                 <div class="filters-grid">
@@ -899,8 +912,8 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                 </div>
 
                 <div class="filter-actions">
-                    <button type="submit" class="btn">🔍 Buscar</button>
-                    <a href="?dia=<?= htmlspecialchars($filtros['dia']) ?>" class="btn btn-secondary">🔄 Limpiar</a>
+                    <button type="submit" name="filtrar" value="1" class="btn">🔍 Buscar</button>
+                    <a href="index.php?dia=<?= htmlspecialchars($filtros['dia']) ?>" class="btn btn-secondary">🔄 Limpiar</a>
                 </div>
             </form>
         </div>
@@ -1139,6 +1152,27 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             if (!hayCompeticiones) {
                 competicionSelect.innerHTML = '<option value="">No hay competiciones</option>';
             }
+        });
+
+        // Prevenir envío de campos vacíos
+        document.querySelector('.filters-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const params = new URLSearchParams();
+            
+            for (const [key, value] of formData) {
+                if (value && value.trim() !== '' && key !== 'filtrar') {
+                    params.append(key, value);
+                }
+            }
+            
+            // Siempre incluir el día
+            if (!params.has('dia')) {
+                params.append('dia', 'hoy');
+            }
+            
+            window.location.href = 'index.php?' + params.toString();
         });
 
         // Auto-refrescar si hay eventos en vivo
