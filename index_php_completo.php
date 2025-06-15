@@ -1,5 +1,5 @@
 <?php
-// index.php - Vista pública con AJAX completo
+// index.php - Vista pública sin AJAX
 require_once 'config/database.php';
 require_once 'models/EventoModel.php';
 require_once 'models/DeporteModel.php';
@@ -50,6 +50,19 @@ function generateToken($evento_id) {
     return hash('sha256', $evento_id . time() . rand());
 }
 
+// Función para construir URL con parámetros
+function buildUrl($params = []) {
+    $currentParams = $_GET;
+    foreach ($params as $key => $value) {
+        if ($value === null || $value === '') {
+            unset($currentParams[$key]);
+        } else {
+            $currentParams[$key] = $value;
+        }
+    }
+    return '?' . http_build_query($currentParams);
+}
+
 // Inicializar conexión
 try {
     $database = new Database();
@@ -63,432 +76,6 @@ $eventoModel = new EventoModel($db);
 $deporteModel = new DeporteModel($db);
 $canalModel = new CanalModel($db);
 $competicionModel = new CompeticionModel($db);
-
-// Procesamiento AJAX
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
-    header('Content-Type: application/json');
-    
-    switch ($_POST['action']) {
-        case 'obtener_competiciones':
-            try {
-                $competiciones_deporte = $competicionModel->obtenerPorDeporte($_POST['deporte_id']);
-                echo json_encode(['success' => true, 'competiciones' => $competiciones_deporte]);
-            } catch (Exception $e) {
-                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
-            }
-            exit;
-            
-        case 'filtrar_eventos':
-            try {
-                // Obtener filtros
-                $filtros_ajax = [
-                    'dia' => $_POST['dia'] ?? 'hoy',
-                    'deporte' => $_POST['deporte'] ?? '',
-                    'competicion' => $_POST['competicion'] ?? '',
-                    'canal' => $_POST['canal'] ?? '',
-                    'buscar' => $_POST['buscar'] ?? ''
-                ];
-
-                // Configurar fechas según el día seleccionado
-                $fecha_inicio = '';
-                $fecha_fin = '';
-                
-                switch ($filtros_ajax['dia']) {
-                    case 'hoy':
-                        $fecha_inicio = date('Y-m-d') . ' 00:00:00';
-                        $fecha_fin = date('Y-m-d') . ' 23:59:59';
-                        break;
-                    case 'manana':
-                        $fecha_inicio = date('Y-m-d', strtotime('+1 day')) . ' 00:00:00';
-                        $fecha_fin = date('Y-m-d', strtotime('+1 day')) . ' 23:59:59';
-                        break;
-                    case 'otros':
-                        $fecha_inicio = date('Y-m-d H:i:s', strtotime('+2 days'));
-                        $fecha_fin = date('Y-m-d H:i:s', strtotime('+30 days'));
-                        break;
-                }
-
-                // Paginación
-                $items_por_pagina = Config::ITEMS_PER_PAGE;
-                $pagina_ajax = max(1, (int)($_POST['pagina'] ?? 1));
-                $offset_ajax = ($pagina_ajax - 1) * $items_por_pagina;
-
-                // Query principal optimizada
-                $query_ajax = "SELECT e.*, 
-                                     d.nombre as deporte_nombre, 
-                                     d.icono as deporte_icono,
-                                     d.duracion_tipica,
-                                     c.nombre as competicion_nombre, 
-                                     c.pais as competicion_pais,
-                                     ch.nombre as canal_nombre,
-                                     ch.logo as canal_logo,
-                                     TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) as minutos_hasta_evento,
-                                     CASE 
-                                        WHEN NOW() BETWEEN e.fecha_evento 
-                                        AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                                        THEN TRUE ELSE FALSE
-                                     END as en_vivo_calculado,
-                                     CASE 
-                                        WHEN TIMESTAMPDIFF(MINUTE, NOW(), e.fecha_evento) BETWEEN -COALESCE(e.duracion_minutos, d.duracion_tipica, 90) AND 15
-                                        THEN TRUE ELSE FALSE
-                                     END as enlace_activo
-                              FROM eventos e
-                              LEFT JOIN deportes d ON e.deporte_id = d.id
-                              LEFT JOIN competiciones c ON e.competicion_id = c.id
-                              LEFT JOIN canales ch ON e.canal_id = ch.id
-                              WHERE e.fecha_evento BETWEEN ? AND ?";
-                
-                // Solo aplicar filtro de eventos no finalizados para "hoy"
-                if ($filtros_ajax['dia'] == 'hoy') {
-                    $query_ajax .= " AND (
-                        e.fecha_evento > NOW()
-                        OR
-                        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                    )";
-                }
-
-                $params_ajax = [$fecha_inicio, $fecha_fin];
-
-                // Aplicar filtros
-                if (!empty($filtros_ajax['deporte'])) {
-                    $query_ajax .= " AND e.deporte_id = ?";
-                    $params_ajax[] = $filtros_ajax['deporte'];
-                }
-                if (!empty($filtros_ajax['competicion'])) {
-                    $query_ajax .= " AND e.competicion_id = ?";
-                    $params_ajax[] = $filtros_ajax['competicion'];
-                }
-                if (!empty($filtros_ajax['canal'])) {
-                    $query_ajax .= " AND e.canal_id = ?";
-                    $params_ajax[] = $filtros_ajax['canal'];
-                }
-                if (!empty($filtros_ajax['buscar'])) {
-                    $query_ajax .= " AND (e.titulo LIKE ? OR e.descripcion LIKE ? OR e.equipo_local LIKE ? OR e.equipo_visitante LIKE ?)";
-                    $buscar_param = '%' . $filtros_ajax['buscar'] . '%';
-                    $params_ajax[] = $buscar_param;
-                    $params_ajax[] = $buscar_param;
-                    $params_ajax[] = $buscar_param;
-                    $params_ajax[] = $buscar_param;
-                }
-
-                // Ordenar: eventos en vivo primero, luego por fecha
-                $query_ajax .= " ORDER BY 
-                                CASE 
-                                    WHEN NOW() BETWEEN e.fecha_evento 
-                                    AND DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                                    THEN 0 
-                                    ELSE 1 
-                                END,
-                                e.fecha_evento ASC";
-
-                // Contar total sin límites
-                $query_count_ajax = "SELECT COUNT(*) as total FROM eventos e
-                                    LEFT JOIN deportes d ON e.deporte_id = d.id
-                                    LEFT JOIN competiciones c ON e.competicion_id = c.id
-                                    LEFT JOIN canales ch ON e.canal_id = ch.id
-                                    WHERE e.fecha_evento BETWEEN ? AND ?";
-                
-                // Solo aplicar filtro de eventos no finalizados para "hoy"
-                if ($filtros_ajax['dia'] == 'hoy') {
-                    $query_count_ajax .= " AND (
-                        e.fecha_evento > NOW()
-                        OR
-                        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                    )";
-                }
-                
-                $params_count = [$fecha_inicio, $fecha_fin];
-                
-                if (!empty($filtros_ajax['deporte'])) {
-                    $query_count_ajax .= " AND e.deporte_id = ?";
-                    $params_count[] = $filtros_ajax['deporte'];
-                }
-                if (!empty($filtros_ajax['competicion'])) {
-                    $query_count_ajax .= " AND e.competicion_id = ?";
-                    $params_count[] = $filtros_ajax['competicion'];
-                }
-                if (!empty($filtros_ajax['canal'])) {
-                    $query_count_ajax .= " AND e.canal_id = ?";
-                    $params_count[] = $filtros_ajax['canal'];
-                }
-                if (!empty($filtros_ajax['buscar'])) {
-                    $query_count_ajax .= " AND (e.titulo LIKE ? OR e.descripcion LIKE ? OR e.equipo_local LIKE ? OR e.equipo_visitante LIKE ?)";
-                    $buscar_param = '%' . $filtros_ajax['buscar'] . '%';
-                    $params_count[] = $buscar_param;
-                    $params_count[] = $buscar_param;
-                    $params_count[] = $buscar_param;
-                    $params_count[] = $buscar_param;
-                }
-                
-                $stmt_count_ajax = $db->prepare($query_count_ajax);
-                $stmt_count_ajax->execute($params_count);
-                $total_eventos_ajax = $stmt_count_ajax->fetch(PDO::FETCH_ASSOC)['total'];
-
-                // Aplicar paginación
-                $query_ajax .= " LIMIT ? OFFSET ?";
-                $params_ajax[] = $items_por_pagina;
-                $params_ajax[] = $offset_ajax;
-
-                $stmt_ajax = $db->prepare($query_ajax);
-                $stmt_ajax->execute($params_ajax);
-                $eventos_ajax = $stmt_ajax->fetchAll(PDO::FETCH_ASSOC);
-
-                // Generar HTML
-                $html_eventos = '';
-                $eventos_en_vivo = 0;
-
-                if (empty($eventos_ajax)) {
-                    $icono_vacio = $filtros_ajax['dia'] == 'hoy' ? '😴' : ($filtros_ajax['dia'] == 'manana' ? '🌙' : '📅');
-                    $mensaje_dia = $filtros_ajax['dia'] == 'hoy' ? 'hoy' : ($filtros_ajax['dia'] == 'manana' ? 'mañana' : 'próximos');
-                    
-                    $html_eventos = '<div class="no-events">
-                        <div class="no-events-icon">' . $icono_vacio . '</div>
-                        <h3>No hay eventos ' . $mensaje_dia . '</h3>
-                        <p>No se encontraron eventos con los filtros aplicados.</p>
-                        <p>Prueba ajustando los filtros o revisa en otro día.</p>
-                    </div>';
-                } else {
-                    $html_eventos = '<div class="events-list" id="events-list">';
-                    
-                    foreach ($eventos_ajax as $evento) {
-                        $enlace_disponible = $evento['enlace_activo'] || $evento['en_vivo_calculado'];
-                        $es_live = $evento['en_vivo_calculado'];
-                        $tiempo_restante = $evento['minutos_hasta_evento'];
-                        $clase_tiempo = $es_live ? 'live' : ($tiempo_restante <= 15 && $tiempo_restante > 0 ? 'soon' : '');
-                        $clase_card = $es_live ? 'live-event' : '';
-                        
-                        if ($es_live) $eventos_en_vivo++;
-
-                        // Generar token si es necesario
-                        if (!isset($evento['token_acceso']) || empty($evento['token_acceso'])) {
-                            $evento['token_acceso'] = generateToken($evento['id']);
-                        }
-
-                        $html_eventos .= '<div class="event-card-wrapper">';
-                        
-                        if ($enlace_disponible) {
-                            $html_eventos .= '<a href="evento.php?id=' . $evento['id'] . '&token=' . $evento['token_acceso'] . '" class="event-link">';
-                        } else {
-                            $html_eventos .= '<div class="event-link disabled">';
-                        }
-
-                        $html_eventos .= '<div class="event-card ' . $clase_card . '">';
-                        
-                        // Sección izquierda
-                        $html_eventos .= '<div class="event-left">';
-                        $html_eventos .= '<div class="event-time ' . $clase_tiempo . '">';
-                        if ($es_live) {
-                            $html_eventos .= '🔴 LIVE<div class="live-indicator">●</div>';
-                        } else {
-                            $html_eventos .= date('H:i', strtotime($evento['fecha_evento']));
-                            if ($tiempo_restante <= 15 && $tiempo_restante > 0) {
-                                $html_eventos .= '<span class="countdown-badge">' . $tiempo_restante . 'min</span>';
-                            }
-                        }
-                        $html_eventos .= '</div>';
-                        
-                        // Información del evento
-                        $html_eventos .= '<div class="event-info">';
-                        $html_eventos .= '<div class="event-title">' . htmlspecialchars($evento['titulo']);
-                        if (isset($evento['destacado']) && $evento['destacado']) {
-                            $html_eventos .= ' <span style="color: #f59e0b;">⭐</span>';
-                        }
-                        $html_eventos .= '</div>';
-                        
-                        $html_eventos .= '<div class="event-details">';
-                        if ($evento['deporte_nombre']) {
-                            $html_eventos .= '<span>⚽ ' . htmlspecialchars($evento['deporte_nombre']) . '</span>';
-                        }
-                        if ($evento['competicion_nombre']) {
-                            $html_eventos .= '<span>• 🏆 ' . htmlspecialchars($evento['competicion_nombre']) . '</span>';
-                        }
-                        if ($filtros_ajax['dia'] != 'hoy') {
-                            $html_eventos .= '<span>• 📅 ' . Config::formatDate($evento['fecha_evento'], 'd/m/Y') . '</span>';
-                        }
-                        $html_eventos .= '</div>';
-
-                        // Información de tiempo
-                        if ($filtros_ajax['dia'] == 'hoy') {
-                            if (!$es_live && $tiempo_restante > 0) {
-                                $html_eventos .= '<div class="tiempo-restante">';
-                                if ($tiempo_restante <= 15) {
-                                    $html_eventos .= '⚡ Disponible en ' . $tiempo_restante . ' minutos';
-                                } else {
-                                    $html_eventos .= '🕒 Comienza en ' . formatTiempoRestante($tiempo_restante);
-                                }
-                                $html_eventos .= '</div>';
-                            } elseif ($es_live) {
-                                $html_eventos .= '<div class="tiempo-restante" style="color: #ef4444; font-weight: 600;">🔴 Transmisión en vivo</div>';
-                            }
-                        } else {
-                            $html_eventos .= '<div class="tiempo-restante">📅 ' . formatTiempoRestante($tiempo_restante) . '</div>';
-                        }
-
-                        $html_eventos .= '</div></div>';
-
-                        // Sección derecha
-                        $html_eventos .= '<div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">';
-                        if ($evento['canal_nombre']) {
-                            $html_eventos .= '<div class="event-channel">📺 ' . htmlspecialchars($evento['canal_nombre']) . '</div>';
-                        }
-                        
-                        $html_eventos .= '<span class="event-status status-' . $evento['estado'] . '">';
-                        if ($es_live) {
-                            $html_eventos .= '🔴 EN VIVO';
-                        } else {
-                            $estado_icons = ['programado' => '📋', 'en_vivo' => '🔴', 'finalizado' => '✅'];
-                            $html_eventos .= ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']);
-                        }
-                        $html_eventos .= '</span>';
-                        
-                        if ($evento['duracion_tipica']) {
-                            $html_eventos .= '<small style="color: #6b7280; font-size: 11px;">⏱️ ~' . $evento['duracion_tipica'] . 'min</small>';
-                        }
-                        $html_eventos .= '</div>';
-
-                        $html_eventos .= '</div>';
-                        
-                        if ($enlace_disponible) {
-                            $html_eventos .= '</a>';
-                        } else {
-                            $html_eventos .= '</div>';
-                        }
-                        
-                        $html_eventos .= '</div>';
-                    }
-                    
-                    $html_eventos .= '</div>';
-                }
-
-                // Generar paginación
-                $total_paginas_ajax = ceil($total_eventos_ajax / $items_por_pagina);
-                $html_paginacion = '';
-                
-                if ($total_paginas_ajax > 1) {
-                    $html_paginacion .= '<div class="pagination">';
-                    
-                    if ($pagina_ajax > 1) {
-                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . ($pagina_ajax - 1) . '); return false;">← Anterior</a>';
-                    } else {
-                        $html_paginacion .= '<span class="disabled">← Anterior</span>';
-                    }
-
-                    $start = max(1, $pagina_ajax - 2);
-                    $end = min($total_paginas_ajax, $pagina_ajax + 2);
-                    
-                    if ($start > 1) {
-                        $html_paginacion .= '<a href="#" onclick="cargarPagina(1); return false;">1</a>';
-                        if ($start > 2) $html_paginacion .= '<span>...</span>';
-                    }
-                    
-                    for ($i = $start; $i <= $end; $i++) {
-                        if ($i == $pagina_ajax) {
-                            $html_paginacion .= '<span class="current">' . $i . '</span>';
-                        } else {
-                            $html_paginacion .= '<a href="#" onclick="cargarPagina(' . $i . '); return false;">' . $i . '</a>';
-                        }
-                    }
-                    
-                    if ($end < $total_paginas_ajax) {
-                        if ($end < $total_paginas_ajax - 1) $html_paginacion .= '<span>...</span>';
-                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . $total_paginas_ajax . '); return false;">' . $total_paginas_ajax . '</a>';
-                    }
-
-                    if ($pagina_ajax < $total_paginas_ajax) {
-                        $html_paginacion .= '<a href="#" onclick="cargarPagina(' . ($pagina_ajax + 1) . '); return false;">Siguiente →</a>';
-                    } else {
-                        $html_paginacion .= '<span class="disabled">Siguiente →</span>';
-                    }
-                    
-                    $html_paginacion .= '</div>';
-                }
-
-                echo json_encode([
-                    'success' => true,
-                    'html' => $html_eventos,
-                    'paginacion' => $html_paginacion,
-                    'total' => $total_eventos_ajax,
-                    'eventos_en_vivo' => $eventos_en_vivo,
-                    'pagina_actual' => $pagina_ajax,
-                    'total_paginas' => $total_paginas_ajax
-                ]);
-                
-            } catch (Exception $e) {
-                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
-            }
-            exit;
-            
-        case 'obtener_conteos':
-            try {
-                // Conteo HOY - solo eventos futuros o en curso
-                $stmt_hoy = $db->prepare("
-                    SELECT COUNT(*) as total 
-                    FROM eventos e
-                    LEFT JOIN deportes d ON e.deporte_id = d.id
-                    WHERE DATE(e.fecha_evento) = CURDATE()
-                    AND (
-                        e.fecha_evento > NOW()
-                        OR
-                        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-                    )
-                ");
-                $stmt_hoy->execute();
-                $count_hoy_ajax = $stmt_hoy->fetch(PDO::FETCH_ASSOC)['total'];
-
-                // Conteo MAÑANA
-                $stmt_manana = $db->prepare("
-                    SELECT COUNT(*) as total 
-                    FROM eventos 
-                    WHERE DATE(fecha_evento) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)
-                ");
-                $stmt_manana->execute();
-                $count_manana_ajax = $stmt_manana->fetch(PDO::FETCH_ASSOC)['total'];
-
-                // Conteo OTROS
-                $stmt_otros = $db->prepare("
-                    SELECT COUNT(*) as total 
-                    FROM eventos 
-                    WHERE DATE(fecha_evento) > DATE_ADD(CURDATE(), INTERVAL 1 DAY) 
-                    AND DATE(fecha_evento) <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)
-                ");
-                $stmt_otros->execute();
-                $count_otros_ajax = $stmt_otros->fetch(PDO::FETCH_ASSOC)['total'];
-
-                echo json_encode([
-                    'success' => true,
-                    'hoy' => $count_hoy_ajax,
-                    'manana' => $count_manana_ajax,
-                    'otros' => $count_otros_ajax
-                ]);
-            } catch (Exception $e) {
-                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
-            }
-            exit;
-            
-        case 'obtener_competiciones_filtradas':
-            try {
-                $deporte_id = $_POST['deporte_id'] ?? null;
-                
-                if ($deporte_id) {
-                    $stmt = $db->prepare("SELECT id, nombre FROM competiciones WHERE deporte_id = ? ORDER BY nombre");
-                    $stmt->execute([$deporte_id]);
-                } else {
-                    $stmt = $db->prepare("SELECT id, nombre FROM competiciones ORDER BY nombre");
-                    $stmt->execute();
-                }
-                
-                $competiciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                
-                echo json_encode([
-                    'success' => true,
-                    'competiciones' => $competiciones
-                ]);
-            } catch (Exception $e) {
-                echo json_encode(['success' => false, 'error' => $e->getMessage()]);
-            }
-            exit;
-    }
-}
 
 // Configuración inicial para carga de página
 $filtros = [
@@ -533,34 +120,44 @@ $deportes = $deporteModel->obtenerTodos();
 $canales = $canalModel->obtenerTodos();
 $competiciones = $competicionModel->obtenerTodos();
 
-// Conteos para botones
-$stmt_hoy = $db->prepare("
-    SELECT COUNT(*) as total 
-    FROM eventos e
-    LEFT JOIN deportes d ON e.deporte_id = d.id
-    WHERE DATE(e.fecha_evento) = CURDATE()
-    AND (
-        e.fecha_evento > NOW()
-        OR
-        NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
-    )
-");
-$stmt_hoy->execute();
-$count_hoy = $stmt_hoy->fetch(PDO::FETCH_ASSOC)['total'];
+// Conteos para botones de día
+try {
+    // Conteo HOY - solo eventos futuros o en curso
+    $stmt_hoy = $db->prepare("
+        SELECT COUNT(*) as total 
+        FROM eventos e
+        LEFT JOIN deportes d ON e.deporte_id = d.id
+        WHERE DATE(e.fecha_evento) = CURDATE()
+        AND (
+            e.fecha_evento > NOW()
+            OR
+            NOW() < DATE_ADD(e.fecha_evento, INTERVAL COALESCE(e.duracion_minutos, d.duracion_tipica, 90) MINUTE)
+        )
+    ");
+    $stmt_hoy->execute();
+    $count_hoy = $stmt_hoy->fetch(PDO::FETCH_ASSOC)['total'];
 
-$stmt_manana = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
-$stmt_manana->execute();
-$count_manana = $stmt_manana->fetch(PDO::FETCH_ASSOC)['total'];
+    // Conteo MAÑANA
+    $stmt_manana = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)");
+    $stmt_manana->execute();
+    $count_manana = $stmt_manana->fetch(PDO::FETCH_ASSOC)['total'];
 
-$stmt_otros = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) > DATE_ADD(CURDATE(), INTERVAL 1 DAY) AND DATE(fecha_evento) <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)");
-$stmt_otros->execute();
-$count_otros = $stmt_otros->fetch(PDO::FETCH_ASSOC)['total'];
+    // Conteo OTROS
+    $stmt_otros = $db->prepare("SELECT COUNT(*) as total FROM eventos WHERE DATE(fecha_evento) > DATE_ADD(CURDATE(), INTERVAL 1 DAY) AND DATE(fecha_evento) <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)");
+    $stmt_otros->execute();
+    $count_otros = $stmt_otros->fetch(PDO::FETCH_ASSOC)['total'];
+} catch (Exception $e) {
+    $count_hoy = 0;
+    $count_manana = 0;
+    $count_otros = 0;
+}
 
-// Cargar eventos iniciales
+// Cargar eventos
 $pagina = max(1, (int)($_GET['pagina'] ?? 1));
 $items_por_pagina = Config::ITEMS_PER_PAGE;
 $offset = ($pagina - 1) * $items_por_pagina;
 
+// Query principal de eventos
 $query_eventos = "SELECT e.*, 
                          d.nombre as deporte_nombre, 
                          d.icono as deporte_icono,
@@ -599,7 +196,7 @@ $params = [
     ':fecha_fin' => $fecha_fin
 ];
 
-// Aplicar filtros iniciales
+// Aplicar filtros
 if (!empty($filtros['deporte'])) {
     $query_eventos .= " AND e.deporte_id = :deporte";
     $params[':deporte'] = $filtros['deporte'];
@@ -631,7 +228,7 @@ $query_eventos .= " ORDER BY
                     END,
                     e.fecha_evento ASC";
 
-// Contar total
+// Contar total para paginación
 $query_count = "SELECT COUNT(*) as total FROM eventos e
                 LEFT JOIN deportes d ON e.deporte_id = d.id
                 LEFT JOIN competiciones c ON e.competicion_id = c.id
@@ -660,23 +257,34 @@ if (!empty($filtros['buscar'])) {
     $query_count .= " AND (e.titulo LIKE :buscar OR e.descripcion LIKE :buscar2 OR e.equipo_local LIKE :buscar3 OR e.equipo_visitante LIKE :buscar4)";
 }
 
-$stmt_count = $db->prepare($query_count);
-foreach ($params as $key => $value) {
-    $stmt_count->bindValue($key, $value);
+try {
+    $stmt_count = $db->prepare($query_count);
+    foreach ($params as $key => $value) {
+        $stmt_count->bindValue($key, $value);
+    }
+    $stmt_count->execute();
+    $total_eventos = $stmt_count->fetch(PDO::FETCH_ASSOC)['total'];
+} catch (Exception $e) {
+    $total_eventos = 0;
+    error_log("Error al contar eventos: " . $e->getMessage());
 }
-$stmt_count->execute();
-$total_eventos = $stmt_count->fetch(PDO::FETCH_ASSOC)['total'];
 
-// Paginación
+// Aplicar paginación
 $query_eventos .= " LIMIT :limite OFFSET :offset";
-$stmt = $db->prepare($query_eventos);
-foreach ($params as $key => $value) {
-    $stmt->bindValue($key, $value);
+
+try {
+    $stmt = $db->prepare($query_eventos);
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    $stmt->bindValue(':limite', (int)$items_por_pagina, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', (int)$offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $eventos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+} catch (Exception $e) {
+    $eventos = [];
+    error_log("Error al obtener eventos: " . $e->getMessage());
 }
-$stmt->bindValue(':limite', (int)$items_por_pagina, PDO::PARAM_INT);
-$stmt->bindValue(':offset', (int)$offset, PDO::PARAM_INT);
-$stmt->execute();
-$eventos = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Generar tokens para eventos que los necesiten
 foreach ($eventos as &$evento) {
@@ -684,11 +292,15 @@ foreach ($eventos as &$evento) {
         $token = generateToken($evento['id']);
         $expira = date('Y-m-d H:i:s', strtotime($evento['fecha_evento'] . ' +3 hours'));
         
-        $update_token = "UPDATE eventos SET token_acceso = ?, token_expira = ? WHERE id = ?";
-        $stmt_token = $db->prepare($update_token);
-        $stmt_token->execute([$token, $expira, $evento['id']]);
-        
-        $evento['token_acceso'] = $token;
+        try {
+            $update_token = "UPDATE eventos SET token_acceso = ?, token_expira = ? WHERE id = ?";
+            $stmt_token = $db->prepare($update_token);
+            $stmt_token->execute([$token, $expira, $evento['id']]);
+            $evento['token_acceso'] = $token;
+        } catch (Exception $e) {
+            // Si falla, usar un token temporal
+            $evento['token_acceso'] = generateToken($evento['id']);
+        }
     }
 }
 
@@ -700,7 +312,7 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FutbolTV.su - <?= $titulo_seccion ?></title>
+    <title>FutbolTV.su - <?= htmlspecialchars($titulo_seccion) ?></title>
     <meta name="description" content="Encuentra todos los eventos deportivos por día. Fútbol, baloncesto, tenis y más deportes en vivo.">
     <style>
         * {
@@ -749,22 +361,6 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             opacity: 0.9;
         }
 
-        .admin-link {
-            background: rgba(255, 255, 255, 0.2);
-            color: white;
-            text-decoration: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-weight: 500;
-            transition: all 0.2s;
-            backdrop-filter: blur(10px);
-        }
-
-        .admin-link:hover {
-            background: rgba(255, 255, 255, 0.3);
-            transform: translateY(-2px);
-        }
-
         /* Botones de día */
         .day-selector {
             background: white;
@@ -796,7 +392,6 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             gap: 8px;
             min-width: 120px;
             justify-content: center;
-            cursor: pointer;
         }
 
         .day-btn:hover {
@@ -834,11 +429,16 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
 
+        .filters-form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
         .filters-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 15px;
-            margin-bottom: 15px;
         }
 
         .filter-group label {
@@ -903,7 +503,6 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             border-radius: 12px;
             padding: 25px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            position: relative;
             min-height: 400px;
         }
 
@@ -1044,16 +643,6 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             border-radius: 10px;
             font-weight: bold;
             animation: blink 1s infinite;
-        }
-
-        .countdown-badge {
-            background: #f59e0b;
-            color: white;
-            padding: 4px 8px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 600;
-            margin-left: 8px;
         }
 
         @keyframes pulse {
@@ -1198,67 +787,6 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             margin-bottom: 8px;
         }
 
-        /* Estilos AJAX */
-        .loading-indicator {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            color: #6366f1;
-            font-size: 14px;
-            font-weight: 500;
-            margin-top: 5px;
-        }
-
-        .loading-overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(255, 255, 255, 0.9);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 10;
-            border-radius: 12px;
-        }
-
-        .loading-content {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 15px;
-            color: #6366f1;
-            font-weight: 500;
-        }
-
-        .loading-spinner {
-            width: 40px;
-            height: 40px;
-            border: 4px solid #e5e7eb;
-            border-top: 4px solid #6366f1;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .event-card-wrapper {
-            transition: all 0.3s ease;
-        }
-
-        .fade-in {
-            animation: fadeIn 0.5s ease-in;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
         /* Responsive */
         @media (max-width: 768px) {
             .container { padding: 15px; }
@@ -1295,27 +823,30 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
         <!-- Selector de Día -->
         <div class="day-selector">
             <div class="day-buttons">
-                <div class="day-btn <?= $filtros['dia'] == 'hoy' ? 'active' : '' ?>" onclick="cambiarDia('hoy')">
+                <a href="<?= buildUrl(['dia' => 'hoy', 'pagina' => null]) ?>" 
+                   class="day-btn <?= $filtros['dia'] == 'hoy' ? 'active' : '' ?>">
                     📅 Hoy
                     <span class="count"><?= $count_hoy ?></span>
-                </div>
+                </a>
                 
-                <div class="day-btn <?= $filtros['dia'] == 'manana' ? 'active' : '' ?>" onclick="cambiarDia('manana')">
+                <a href="<?= buildUrl(['dia' => 'manana', 'pagina' => null]) ?>" 
+                   class="day-btn <?= $filtros['dia'] == 'manana' ? 'active' : '' ?>">
                     🌅 Mañana
                     <span class="count"><?= $count_manana ?></span>
-                </div>
+                </a>
                 
-                <div class="day-btn <?= $filtros['dia'] == 'otros' ? 'active' : '' ?>" onclick="cambiarDia('otros')">
+                <a href="<?= buildUrl(['dia' => 'otros', 'pagina' => null]) ?>" 
+                   class="day-btn <?= $filtros['dia'] == 'otros' ? 'active' : '' ?>">
                     📆 Próximos
                     <span class="count"><?= $count_otros ?></span>
-                </div>
+                </a>
             </div>
         </div>
 
         <!-- Filtros -->
         <div class="filters">
-            <div id="filtros-form">
-                <input type="hidden" id="dia-actual" value="<?= $filtros['dia'] ?>">
+            <form method="get" action="" class="filters-form">
+                <input type="hidden" name="dia" value="<?= htmlspecialchars($filtros['dia']) ?>">
                 
                 <div class="filters-grid">
                     <div class="filter-group">
@@ -1325,11 +856,7 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                                name="buscar" 
                                class="search-input" 
                                placeholder="Buscar equipos, eventos..." 
-                               value="<?= htmlspecialchars($filtros['buscar']) ?>"
-                               autocomplete="off">
-                        <div id="search-loading" class="loading-indicator" style="display: none;">
-                            <span>🔍 Buscando...</span>
-                        </div>
+                               value="<?= htmlspecialchars($filtros['buscar']) ?>">
                     </div>
 
                     <div class="filter-group">
@@ -1372,30 +899,28 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                 </div>
 
                 <div class="filter-actions">
-                    <button type="button" id="limpiar-filtros" class="btn btn-secondary">🔄 Limpiar</button>
-                    <div id="filter-loading" class="loading-indicator" style="display: none;">
-                        <span>⏳ Filtrando...</span>
-                    </div>
+                    <button type="submit" class="btn">🔍 Buscar</button>
+                    <a href="?dia=<?= htmlspecialchars($filtros['dia']) ?>" class="btn btn-secondary">🔄 Limpiar</a>
                 </div>
-            </div>
+            </form>
         </div>
 
         <!-- Lista de Eventos -->
         <div class="events-section">
             <div class="events-header">
                 <div>
-                    <h2 id="titulo-seccion">
+                    <h2>
                         <?php if ($filtros['dia'] == 'hoy'): ?>
-                            📅 <?= $titulo_seccion ?>
+                            📅 <?= htmlspecialchars($titulo_seccion) ?>
                         <?php elseif ($filtros['dia'] == 'manana'): ?>
-                            🌅 <?= $titulo_seccion ?>
+                            🌅 <?= htmlspecialchars($titulo_seccion) ?>
                         <?php else: ?>
-                            📆 <?= $titulo_seccion ?>
+                            📆 <?= htmlspecialchars($titulo_seccion) ?>
                         <?php endif; ?>
                     </h2>
-                    <div class="subtitle"><?= $subtitulo ?></div>
+                    <div class="subtitle"><?= htmlspecialchars($subtitulo) ?></div>
                 </div>
-                <div class="events-count" id="events-count">
+                <div class="events-count">
                     <?= $total_eventos ?> evento<?= $total_eventos != 1 ? 's' : '' ?>
                     <?php 
                     $eventos_en_vivo = array_filter($eventos, function($evento) {
@@ -1409,332 +934,180 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
                 </div>
             </div>
 
-            <div id="loading-overlay" class="loading-overlay" style="display: none;">
-                <div class="loading-content">
-                    <div class="loading-spinner"></div>
-                    <span>Cargando eventos...</span>
-                </div>
-            </div>
-
-            <div id="eventos-container">
-                <?php if (empty($eventos)): ?>
-                    <div class="no-events">
-                        <div class="no-events-icon">
-                            <?php if ($filtros['dia'] == 'hoy'): ?>
-                                😴
-                            <?php elseif ($filtros['dia'] == 'manana'): ?>
-                                🌙
-                            <?php else: ?>
-                                📅
-                            <?php endif; ?>
-                        </div>
-                        <h3>No hay eventos <?= $filtros['dia'] == 'hoy' ? 'hoy' : ($filtros['dia'] == 'manana' ? 'mañana' : 'próximos') ?></h3>
-                        <p>No se encontraron eventos para <?= strtolower($titulo_seccion) ?> con los filtros aplicados.</p>
-                        <p>Prueba ajustando los filtros o revisa en otro día.</p>
-                    </div>
-                <?php else: ?>
-                    <div class="events-list" id="events-list">
-                        <?php foreach ($eventos as $evento): ?>
-                        <?php 
-                            $enlace_disponible = $evento['enlace_activo'] || $evento['en_vivo_calculado'];
-                            $es_live = $evento['en_vivo_calculado'];
-                            $tiempo_restante = $evento['minutos_hasta_evento'];
-                            $clase_tiempo = $es_live ? 'live' : ($tiempo_restante <= 15 && $tiempo_restante > 0 ? 'soon' : '');
-                            $clase_card = $es_live ? 'live-event' : '';
-                        ?>
-                        
-                        <div class="event-card-wrapper">
-                            <?php if ($enlace_disponible): ?>
-                                <a href="evento.php?id=<?= $evento['id'] ?>&token=<?= $evento['token_acceso'] ?>" class="event-link">
-                            <?php else: ?>
-                                <div class="event-link disabled">
-                            <?php endif; ?>
-                            
-                                <div class="event-card <?= $clase_card ?>">
-                                    <div class="event-left">
-                                        <div class="event-time <?= $clase_tiempo ?>">
-                                            <?php if ($es_live): ?>
-                                                🔴 LIVE
-                                                <div class="live-indicator">●</div>
-                                            <?php else: ?>
-                                                <?= date('H:i', strtotime($evento['fecha_evento'])) ?>
-                                                <?php if ($tiempo_restante <= 15 && $tiempo_restante > 0): ?>
-                                                    <span class="countdown-badge"><?= $tiempo_restante ?>min</span>
-                                                <?php endif; ?>
-                                            <?php endif; ?>
-                                        </div>
-                                        
-                                        <div class="event-info">
-                                            <div class="event-title">
-                                                <?= htmlspecialchars($evento['titulo']) ?>
-                                                <?php if (isset($evento['destacado']) && $evento['destacado']): ?>
-                                                    <span style="color: #f59e0b;">⭐</span>
-                                                <?php endif; ?>
-                                            </div>
-                                            <div class="event-details">
-                                                <?php if ($evento['deporte_nombre']): ?>
-                                                    <span>⚽ <?= htmlspecialchars($evento['deporte_nombre']) ?></span>
-                                                <?php endif; ?>
-                                                <?php if ($evento['competicion_nombre']): ?>
-                                                    <span>• 🏆 <?= htmlspecialchars($evento['competicion_nombre']) ?></span>
-                                                <?php endif; ?>
-                                                <?php if ($filtros['dia'] != 'hoy'): ?>
-                                                    <span>• 📅 <?= Config::formatDate($evento['fecha_evento'], 'd/m/Y') ?></span>
-                                                <?php endif; ?>
-                                            </div>
-                                            
-                                            <?php if ($filtros['dia'] == 'hoy'): ?>
-                                                <?php if (!$es_live && $tiempo_restante > 0): ?>
-                                                    <div class="tiempo-restante">
-                                                        <?php if ($tiempo_restante <= 15): ?>
-                                                            ⚡ Disponible en <?= $tiempo_restante ?> minutos
-                                                        <?php else: ?>
-                                                            🕒 Comienza en <?= formatTiempoRestante($tiempo_restante) ?>
-                                                        <?php endif; ?>
-                                                    </div>
-                                                <?php elseif ($es_live): ?>
-                                                    <div class="tiempo-restante" style="color: #ef4444; font-weight: 600;">
-                                                        🔴 Transmisión en vivo
-                                                    </div>
-                                                <?php endif; ?>
-                                            <?php else: ?>
-                                                <div class="tiempo-restante">
-                                                    📅 <?= formatTiempoRestante($tiempo_restante) ?>
-                                                </div>
-                                            <?php endif; ?>
-                                        </div>
-                                    </div>
-
-                                    <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
-                                        <?php if ($evento['canal_nombre']): ?>
-                                            <div class="event-channel">📺 <?= htmlspecialchars($evento['canal_nombre']) ?></div>
-                                        <?php endif; ?>
-                                        
-                                        <span class="event-status status-<?= $evento['estado'] ?>">
-                                            <?php if ($es_live): ?>
-                                                🔴 EN VIVO
-                                            <?php else: ?>
-                                                <?php $estado_icons = ['programado' => '📋', 'en_vivo' => '🔴', 'finalizado' => '✅']; ?>
-                                                <?= ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']) ?>
-                                            <?php endif; ?>
-                                        </span>
-                                        
-                                        <?php if ($evento['duracion_tipica']): ?>
-                                            <small style="color: #6b7280; font-size: 11px;">
-                                                ⏱️ ~<?= $evento['duracion_tipica'] ?>min
-                                            </small>
-                                        <?php endif; ?>
-                                    </div>
-                                </div>
-                            
-                            <?php if ($enlace_disponible): ?>
-                                </a>
-                            <?php else: ?>
-                                </div>
-                            <?php endif; ?>
-                        </div>
-                        <?php endforeach; ?>
-                    </div>
-
-                    <!-- Paginación -->
-                    <div id="paginacion-container">
-                        <?php if ($total_paginas > 1): ?>
-                        <div class="pagination">
-                            <?php if ($pagina > 1): ?>
-                                <a href="#" onclick="cargarPagina(<?= $pagina - 1 ?>); return false;">← Anterior</a>
-                            <?php else: ?>
-                                <span class="disabled">← Anterior</span>
-                            <?php endif; ?>
-
-                            <?php
-                            $start = max(1, $pagina - 2);
-                            $end = min($total_paginas, $pagina + 2);
-                            
-                            if ($start > 1) {
-                                echo '<a href="#" onclick="cargarPagina(1); return false;">1</a>';
-                                if ($start > 2) echo '<span>...</span>';
-                            }
-                            
-                            for ($i = $start; $i <= $end; $i++):
-                            ?>
-                                <?php if ($i == $pagina): ?>
-                                    <span class="current"><?= $i ?></span>
-                                <?php else: ?>
-                                    <a href="#" onclick="cargarPagina(<?= $i ?>); return false;"><?= $i ?></a>
-                                <?php endif; ?>
-                            <?php endfor; ?>
-                            
-                            <?php if ($end < $total_paginas): ?>
-                                <?php if ($end < $total_paginas - 1) echo '<span>...</span>'; ?>
-                                <a href="#" onclick="cargarPagina(<?= $total_paginas ?>); return false;"><?= $total_paginas ?></a>
-                            <?php endif; ?>
-
-                            <?php if ($pagina < $total_paginas): ?>
-                                <a href="#" onclick="cargarPagina(<?= $pagina + 1 ?>); return false;">Siguiente →</a>
-                            <?php else: ?>
-                                <span class="disabled">Siguiente →</span>
-                            <?php endif; ?>
-                        </div>
+            <?php if (empty($eventos)): ?>
+                <div class="no-events">
+                    <div class="no-events-icon">
+                        <?php if ($filtros['dia'] == 'hoy'): ?>
+                            😴
+                        <?php elseif ($filtros['dia'] == 'manana'): ?>
+                            🌙
+                        <?php else: ?>
+                            📅
                         <?php endif; ?>
                     </div>
+                    <h3>No hay eventos <?= $filtros['dia'] == 'hoy' ? 'hoy' : ($filtros['dia'] == 'manana' ? 'mañana' : 'próximos') ?></h3>
+                    <p>No se encontraron eventos para <?= strtolower($titulo_seccion) ?> con los filtros aplicados.</p>
+                    <p>Prueba ajustando los filtros o revisa en otro día.</p>
+                </div>
+            <?php else: ?>
+                <div class="events-list">
+                    <?php foreach ($eventos as $evento): ?>
+                    <?php 
+                        $enlace_disponible = $evento['enlace_activo'] || $evento['en_vivo_calculado'];
+                        $es_live = $evento['en_vivo_calculado'];
+                        $tiempo_restante = $evento['minutos_hasta_evento'];
+                        $clase_tiempo = $es_live ? 'live' : ($tiempo_restante <= 15 && $tiempo_restante > 0 ? 'soon' : '');
+                        $clase_card = $es_live ? 'live-event' : '';
+                        
+                        // Asegurar token
+                        if (empty($evento['token_acceso'])) {
+                            $evento['token_acceso'] = generateToken($evento['id']);
+                        }
+                    ?>
+                    
+                    <div class="event-card-wrapper">
+                        <?php if ($enlace_disponible): ?>
+                            <a href="evento.php?id=<?= $evento['id'] ?>&token=<?= $evento['token_acceso'] ?>" class="event-link">
+                        <?php else: ?>
+                            <div class="event-link disabled">
+                        <?php endif; ?>
+                        
+                            <div class="event-card <?= $clase_card ?>">
+                                <div class="event-left">
+                                    <div class="event-time <?= $clase_tiempo ?>">
+                                        <?php if ($es_live): ?>
+                                            🔴 LIVE
+                                            <div class="live-indicator">●</div>
+                                        <?php else: ?>
+                                            <?= date('H:i', strtotime($evento['fecha_evento'])) ?>
+                                            <?php if ($tiempo_restante <= 15 && $tiempo_restante > 0): ?>
+                                                <span class="countdown-badge" style="position: absolute; top: -8px; right: -8px; background: #f59e0b; color: white; padding: 2px 6px; border-radius: 10px; font-size: 10px;"><?= $tiempo_restante ?>min</span>
+                                            <?php endif; ?>
+                                        <?php endif; ?>
+                                    </div>
+                                    
+                                    <div class="event-info">
+                                        <div class="event-title">
+                                            <?= htmlspecialchars($evento['titulo']) ?>
+                                            <?php if (isset($evento['destacado']) && $evento['destacado']): ?>
+                                                <span style="color: #f59e0b;">⭐</span>
+                                            <?php endif; ?>
+                                        </div>
+                                        <div class="event-details">
+                                            <?php if ($evento['deporte_nombre']): ?>
+                                                <span>⚽ <?= htmlspecialchars($evento['deporte_nombre']) ?></span>
+                                            <?php endif; ?>
+                                            <?php if ($evento['competicion_nombre']): ?>
+                                                <span>• 🏆 <?= htmlspecialchars($evento['competicion_nombre']) ?></span>
+                                            <?php endif; ?>
+                                            <?php if ($filtros['dia'] != 'hoy'): ?>
+                                                <span>• 📅 <?= Config::formatDate($evento['fecha_evento'], 'd/m/Y') ?></span>
+                                            <?php endif; ?>
+                                        </div>
+                                        
+                                        <?php if ($filtros['dia'] == 'hoy'): ?>
+                                            <?php if (!$es_live && $tiempo_restante > 0): ?>
+                                                <div class="tiempo-restante">
+                                                    <?php if ($tiempo_restante <= 15): ?>
+                                                        ⚡ Disponible en <?= $tiempo_restante ?> minutos
+                                                    <?php else: ?>
+                                                        🕒 Comienza en <?= formatTiempoRestante($tiempo_restante) ?>
+                                                    <?php endif; ?>
+                                                </div>
+                                            <?php elseif ($es_live): ?>
+                                                <div class="tiempo-restante" style="color: #ef4444; font-weight: 600;">
+                                                    🔴 Transmisión en vivo
+                                                </div>
+                                            <?php endif; ?>
+                                        <?php else: ?>
+                                            <div class="tiempo-restante">
+                                                📅 <?= formatTiempoRestante($tiempo_restante) ?>
+                                            </div>
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+
+                                <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
+                                    <?php if ($evento['canal_nombre']): ?>
+                                        <div class="event-channel">📺 <?= htmlspecialchars($evento['canal_nombre']) ?></div>
+                                    <?php endif; ?>
+                                    
+                                    <span class="event-status status-<?= $evento['estado'] ?>">
+                                        <?php if ($es_live): ?>
+                                            🔴 EN VIVO
+                                        <?php else: ?>
+                                            <?php $estado_icons = ['programado' => '📋', 'en_vivo' => '🔴', 'finalizado' => '✅']; ?>
+                                            <?= ($estado_icons[$evento['estado']] ?? '') . ' ' . Config::getEstadoFormateado($evento['estado']) ?>
+                                        <?php endif; ?>
+                                    </span>
+                                    
+                                    <?php if ($evento['duracion_tipica']): ?>
+                                        <small style="color: #6b7280; font-size: 11px;">
+                                            ⏱️ ~<?= $evento['duracion_tipica'] ?>min
+                                        </small>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        
+                        <?php if ($enlace_disponible): ?>
+                            </a>
+                        <?php else: ?>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+
+                <!-- Paginación -->
+                <?php if ($total_paginas > 1): ?>
+                <div class="pagination">
+                    <?php if ($pagina > 1): ?>
+                        <a href="<?= buildUrl(['pagina' => $pagina - 1]) ?>">← Anterior</a>
+                    <?php else: ?>
+                        <span class="disabled">← Anterior</span>
+                    <?php endif; ?>
+
+                    <?php
+                    $start = max(1, $pagina - 2);
+                    $end = min($total_paginas, $pagina + 2);
+                    
+                    if ($start > 1) {
+                        echo '<a href="' . buildUrl(['pagina' => 1]) . '">1</a>';
+                        if ($start > 2) echo '<span>...</span>';
+                    }
+                    
+                    for ($i = $start; $i <= $end; $i++):
+                    ?>
+                        <?php if ($i == $pagina): ?>
+                            <span class="current"><?= $i ?></span>
+                        <?php else: ?>
+                            <a href="<?= buildUrl(['pagina' => $i]) ?>"><?= $i ?></a>
+                        <?php endif; ?>
+                    <?php endfor; ?>
+                    
+                    <?php if ($end < $total_paginas): ?>
+                        <?php if ($end < $total_paginas - 1) echo '<span>...</span>'; ?>
+                        <a href="<?= buildUrl(['pagina' => $total_paginas]) ?>"><?= $total_paginas ?></a>
+                    <?php endif; ?>
+
+                    <?php if ($pagina < $total_paginas): ?>
+                        <a href="<?= buildUrl(['pagina' => $pagina + 1]) ?>">Siguiente →</a>
+                    <?php else: ?>
+                        <span class="disabled">Siguiente →</span>
+                    <?php endif; ?>
+                </div>
                 <?php endif; ?>
-            </div>
+            <?php endif; ?>
         </div>
     </div>
 
     <script>
-        // Variables globales
-        let searchTimeout;
-        let filterTimeout;
-        let currentPage = 1;
-        let isLoading = false;
-
-        // Función principal para filtrar eventos
-        async function filtrarEventos(pagina = 1, mostrarCarga = true) {
-            if (isLoading) return;
-            
-            isLoading = true;
-            
-            const diaActual = document.getElementById('dia-actual').value;
-            const filtros = {
-                action: 'filtrar_eventos',
-                dia: diaActual,
-                deporte: document.getElementById('deporte').value,
-                competicion: document.getElementById('competicion').value,
-                canal: document.getElementById('canal').value,
-                buscar: document.getElementById('buscar').value,
-                pagina: pagina
-            };
-
-            if (mostrarCarga) {
-                mostrarCargando(true);
-            }
-
-            try {
-                const response = await fetch('index.php', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: new URLSearchParams(filtros)
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    document.getElementById('eventos-container').innerHTML = result.html;
-                    document.getElementById('paginacion-container').innerHTML = result.paginacion;
-                    
-                    let contadorTexto = result.total + ' evento' + (result.total != 1 ? 's' : '');
-                    if (result.eventos_en_vivo > 0) {
-                        contadorTexto += '<span class="live-count">🔴 ' + result.eventos_en_vivo + ' EN VIVO</span>';
-                    }
-                    document.getElementById('events-count').innerHTML = contadorTexto;
-
-                    currentPage = result.pagina_actual;
-
-                    // Animaciones de entrada
-                    const eventCards = document.querySelectorAll('.event-card-wrapper');
-                    eventCards.forEach((card, index) => {
-                        card.classList.add('fade-in');
-                        card.style.animationDelay = `${index * 0.05}s`;
-                    });
-
-                    // Scroll suave al contenedor
-                    if (pagina !== currentPage) {
-                        document.querySelector('.events-section').scrollIntoView({ 
-                            behavior: 'smooth', 
-                            block: 'start' 
-                        });
-                    }
-
-                    actualizarConteosDias();
-                }
-            } catch (error) {
-                console.error('Error al filtrar eventos:', error);
-                mostrarError('Error al cargar eventos. Inténtalo de nuevo.');
-            } finally {
-                isLoading = false;
-                if (mostrarCarga) {
-                    mostrarCargando(false);
-                }
-            }
-        }
-
-        // Actualizar conteos de días
-        async function actualizarConteosDias() {
-            try {
-                const response = await fetch('index.php', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: new URLSearchParams({ action: 'obtener_conteos' })
-                });
-
-                const result = await response.json();
-                
-                if (result.success) {
-                    document.querySelector('.day-btn:nth-child(1) .count').textContent = result.hoy;
-                    document.querySelector('.day-btn:nth-child(2) .count').textContent = result.manana;
-                    document.querySelector('.day-btn:nth-child(3) .count').textContent = result.otros;
-                }
-            } catch (error) {
-                console.error('Error al actualizar conteos:', error);
-            }
-        }
-
-        // Mostrar/ocultar cargando
-        function mostrarCargando(mostrar) {
-            const overlay = document.getElementById('loading-overlay');
-            overlay.style.display = mostrar ? 'flex' : 'none';
-        }
-
-        // Cargar página
-        function cargarPagina(pagina) {
-            filtrarEventos(pagina);
-        }
-
-        // Cambiar día
-        function cambiarDia(dia) {
-            document.getElementById('dia-actual').value = dia;
-            
-            // Actualizar botones activos
-            document.querySelectorAll('.day-btn').forEach(btn => btn.classList.remove('active'));
-            event.currentTarget.classList.add('active');
-            
-            // Actualizar título
-            const titulos = {
-                'hoy': '📅 Eventos de Hoy',
-                'manana': '🌅 Eventos de Mañana',
-                'otros': '📆 Próximos Eventos'
-            };
-            document.querySelector('#titulo-seccion').textContent = titulos[dia];
-            
-            currentPage = 1;
-            filtrarEventos(1);
-        }
-
-        // Mostrar error
-        function mostrarError(mensaje) {
-            const html = `
-                <div class="no-events fade-in">
-                    <div class="no-events-icon">⚠️</div>
-                    <h3>Error al cargar</h3>
-                    <p>${mensaje}</p>
-                </div>
-            `;
-            
-            document.getElementById('eventos-container').innerHTML = html;
-        }
-
-        // Actualizar competiciones según deporte
-        async function actualizarCompeticiones() {
-            const deporteId = document.getElementById('deporte').value;
+        // Filtrar competiciones según deporte seleccionado
+        document.getElementById('deporte').addEventListener('change', function() {
+            const deporteId = this.value;
             const competicionSelect = document.getElementById('competicion');
             const competicionActual = competicionSelect.value;
             
-            // Si no hay deporte seleccionado, mostrar todas
             if (!deporteId) {
                 // Mostrar todas las opciones
                 Array.from(competicionSelect.options).forEach(option => {
@@ -1766,64 +1139,14 @@ $total_paginas = ceil($total_eventos / $items_por_pagina);
             if (!hayCompeticiones) {
                 competicionSelect.innerHTML = '<option value="">No hay competiciones</option>';
             }
-        }
-
-        // Event listeners
-        document.addEventListener('DOMContentLoaded', function() {
-            // Búsqueda con debounce
-            const searchInput = document.getElementById('buscar');
-            searchInput.addEventListener('input', function() {
-                clearTimeout(searchTimeout);
-                document.getElementById('search-loading').style.display = 'flex';
-                
-                searchTimeout = setTimeout(() => {
-                    document.getElementById('search-loading').style.display = 'none';
-                    currentPage = 1;
-                    filtrarEventos(1, false);
-                }, 500);
-            });
-
-            // Filtros
-            const selectores = ['deporte', 'competicion', 'canal'];
-            selectores.forEach(id => {
-                document.getElementById(id).addEventListener('change', function() {
-                    if (id === 'deporte') {
-                        actualizarCompeticiones();
-                    }
-                    currentPage = 1;
-                    filtrarEventos(1);
-                });
-            });
-
-            // Limpiar filtros
-            document.getElementById('limpiar-filtros').addEventListener('click', function() {
-                document.getElementById('buscar').value = '';
-                document.getElementById('deporte').value = '';
-                document.getElementById('competicion').value = '';
-                document.getElementById('canal').value = '';
-                actualizarCompeticiones();
-                currentPage = 1;
-                filtrarEventos(1);
-            });
-
-            // Actualizar cada 30 segundos si hay eventos en vivo
-            setInterval(() => {
-                const liveCount = document.querySelector('.live-count');
-                if (liveCount && !isLoading) {
-                    filtrarEventos(currentPage, false);
-                }
-            }, 30000);
-
-            // Inicializar competiciones
-            actualizarCompeticiones();
         });
 
-        // Prevenir comportamiento por defecto de enlaces
-        document.addEventListener('click', function(e) {
-            if (e.target.matches('.pagination a')) {
-                e.preventDefault();
-            }
-        });
+        // Auto-refrescar si hay eventos en vivo
+        <?php if (count($eventos_en_vivo) > 0): ?>
+        setTimeout(function() {
+            location.reload();
+        }, 30000); // Refrescar cada 30 segundos
+        <?php endif; ?>
     </script>
 </body>
 </html>
